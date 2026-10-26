@@ -1,11 +1,16 @@
-import { type DAGNode, type MerkleDAG, verifyNodeHash } from './merkleDAG';
+import { type DAGNode, type MerkleDAG, verifyNodeHash, verifyNodeSignature } from './merkleDAG';
 import { happensBefore } from './secureVectorClock';
 
 /**
  * Reasons a DAG branch might be quarantined.
  */
 export type QuarantineReason =
-  'hash-tamper' | 'long-range-attack' | 'clock-rewind' | 'clock-fabrication' | 'orphan-fork';
+  | 'hash-tamper'
+  | 'bad-signature'
+  | 'long-range-attack'
+  | 'clock-rewind'
+  | 'clock-fabrication'
+  | 'orphan-fork';
 
 /**
  * Record of a quarantined branch for audit and healing.
@@ -105,12 +110,16 @@ export class ByzantineHealer {
    * This is the main entry point. Call it before merging a remote DAG.
    * O(n) where n = number of incoming nodes.
    */
-  heal(incoming: MerkleDAG, knownTips: readonly string[]): HealResult {
+  heal(
+    incoming: MerkleDAG,
+    knownTips: readonly string[],
+    options: { requireSignatures?: boolean } = {},
+  ): HealResult {
     const accepted: DAGNode[] = [];
     const rejected: DAGNode[] = [];
     const quarantined: QuarantineRecord[] = [];
 
-    // Phase 1: Hash integrity check.
+    // Phase 1: Hash & Ed25519 cryptographic signature integrity check.
     const allNodes: DAGNode[] = [];
     const visitedHashes = new Set<string>();
     for (const tipHash of incoming.tips) {
@@ -134,6 +143,13 @@ export class ByzantineHealer {
       }
       if (!verifyNodeHash(node)) {
         this.quarantineSubtree(incoming, node.hash, 'hash-tamper');
+        quarantined.push(this.quarantineRecords[this.quarantineRecords.length - 1]);
+        rejected.push(node);
+        continue;
+      }
+      const hasSigMeta = node.signature !== undefined || node.signerPublicKey !== undefined;
+      if ((options.requireSignatures || hasSigMeta) && !verifyNodeSignature(node)) {
+        this.quarantineSubtree(incoming, node.hash, 'bad-signature');
         quarantined.push(this.quarantineRecords[this.quarantineRecords.length - 1]);
         rejected.push(node);
         continue;

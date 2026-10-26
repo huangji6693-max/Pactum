@@ -1,3 +1,5 @@
+import { Keypair } from '@stellar/stellar-sdk';
+
 import { signFrame, verifyFrame } from './signing';
 
 /**
@@ -165,4 +167,123 @@ export function areConcurrent(a: Record<string, number>, b: Record<string, numbe
     if (va > vb) hasStrictlyGreater = true;
   }
   return hasStrictlyLess && hasStrictlyGreater;
+}
+
+/**
+ * Create an Ed25519-signed vector clock using a Stellar Keypair.
+ */
+export function createEd25519VectorClock(
+  keypair: Keypair,
+  localCounter: number,
+  peerCounters: Record<string, number> = {},
+): SecureVectorClock {
+  const address = keypair.publicKey();
+  const entries: Record<string, SignedClockEntry> = {};
+
+  const signPayload = (addr: string, counter: number): Uint8Array => {
+    const payload = new TextEncoder().encode(serializeClockEntry(addr, counter));
+    const sig = keypair.sign(Buffer.from(payload));
+    return new Uint8Array(sig);
+  };
+
+  entries[address] = {
+    address,
+    counter: localCounter,
+    signature: signPayload(address, localCounter),
+  };
+
+  for (const [peerAddr, counter] of Object.entries(peerCounters)) {
+    if (peerAddr === address) continue;
+    entries[peerAddr] = {
+      address: peerAddr,
+      counter,
+      signature: signPayload(peerAddr, counter),
+    };
+  }
+
+  const allCounters: Record<string, number> = {};
+  for (const [addr, entry] of Object.entries(entries)) {
+    allCounters[addr] = entry.counter;
+  }
+
+  return {
+    entries,
+    serialized: serializeClock(allCounters),
+  };
+}
+
+/**
+ * Verify an Ed25519-signed vector clock entry against the signer's Stellar public key.
+ */
+export function verifyEd25519VectorClock(
+  clock: SecureVectorClock,
+  signerAddress: string,
+): boolean {
+  try {
+    const pub = Keypair.fromPublicKey(signerAddress);
+    for (const [address, entry] of Object.entries(clock.entries)) {
+      if (entry.address !== address || entry.counter < 0) return false;
+      const payload = new TextEncoder().encode(serializeClockEntry(address, entry.counter));
+      if (!pub.verify(Buffer.from(payload), Buffer.from(entry.signature))) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface PrunedVectorClockResult {
+  readonly pruned: Record<string, number>;
+  readonly baselineFloor: number;
+  readonly prunedPeers: string[];
+}
+
+/**
+ * Prunes saturated vector clock entries that have been causally acknowledged
+ * across all active peers (`minCausalFloor`) or belong to inactive/retired peers,
+ * while preserving relative causal ordering above the baseline floor.
+ */
+export function pruneSaturatedVectorClock(
+  clock: Record<string, number>,
+  minCausalFloor: Record<string, number> = {},
+  activePeers?: ReadonlySet<string>,
+): PrunedVectorClockResult {
+  const keys = Object.keys(clock);
+  if (keys.length === 0) {
+    return { pruned: {}, baselineFloor: 0, prunedPeers: [] };
+  }
+
+  const floorValues = keys.map((k) => Math.min(clock[k] ?? 0, minCausalFloor[k] ?? 0));
+  const baselineFloor = floorValues.length > 0 ? Math.min(...floorValues) : 0;
+
+  const pruned: Record<string, number> = {};
+  const prunedPeers: string[] = [];
+
+  for (const key of keys) {
+    const val = clock[key] ?? 0;
+    const peerFloor = minCausalFloor[key] ?? baselineFloor;
+    const isInactive = activePeers !== undefined && !activePeers.has(key);
+
+    if (isInactive && val <= peerFloor) {
+      prunedPeers.push(key);
+      continue;
+    }
+
+    if (val <= peerFloor && keys.length > 1 && peerFloor > 0) {
+      prunedPeers.push(key);
+      continue;
+    }
+
+    pruned[key] = val;
+  }
+
+  // Ensure at least the dominant peer entry remains so clock is non-empty.
+  if (Object.keys(pruned).length === 0) {
+    const topKey = keys.reduce((a, b) => ((clock[a] ?? 0) >= (clock[b] ?? 0) ? a : b));
+    pruned[topKey] = clock[topKey];
+  }
+
+  return { pruned, baselineFloor, prunedPeers };
 }

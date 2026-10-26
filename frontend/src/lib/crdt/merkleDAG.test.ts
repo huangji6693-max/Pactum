@@ -1,6 +1,21 @@
+import { Keypair } from '@stellar/stellar-sdk';
 import { describe, expect, it } from 'vitest';
 
-import { createDAGNode, verifyNodeHash, hashVectorClock, MerkleDAG } from './merkleDAG';
+import { ByzantineHealer } from './byzantineHealer';
+import {
+  createDAGNode,
+  createSignedDAGNode,
+  verifyNodeHash,
+  verifyNodeSignature,
+  hashVectorClock,
+  encodeMilestonePayload,
+  MerkleDAG,
+} from './merkleDAG';
+import {
+  createEd25519VectorClock,
+  verifyEd25519VectorClock,
+  pruneSaturatedVectorClock,
+} from './secureVectorClock';
 
 function randomBytes(n: number): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(n));
@@ -182,5 +197,216 @@ describe('MerkleDAG', () => {
     dag.addNode(node);
     expect(dag.isKnown(node.hash)).toBe(true);
     expect(dag.isKnown('nope')).toBe(false);
+  });
+
+  describe('Ed25519 cryptographic signatures, DAG compaction, and 3-way partition merge (Issue #309)', () => {
+    it('accepts valid Ed25519 signed nodes and rejects nodes with invalid or mismatched signatures', () => {
+      const aliceKey = Keypair.random();
+      const attackerKey = Keypair.random();
+      const dag = new MerkleDAG();
+
+      const validSigned = createSignedDAGNode(
+        aliceKey,
+        1,
+        1_000,
+        encodeMilestonePayload({
+          milestoneId: 'm-1',
+          status: 'fulfilled',
+          updatedAt: 1_000,
+        }),
+        [],
+        { [aliceKey.publicKey()]: 1 },
+      );
+
+      expect(verifyNodeSignature(validSigned)).toBe(true);
+      expect(dag.addSignedNode(validSigned)).toBe(true);
+
+      // Mismatched signer public key (signed by attacker, claiming alice as author)
+      const forgedByAttacker = {
+        ...validSigned,
+        signature: new Uint8Array(attackerKey.sign(Buffer.from('forged-payload'))),
+      };
+      expect(verifyNodeSignature(forgedByAttacker)).toBe(false);
+      expect(dag.addSignedNode(forgedByAttacker)).toBe(false);
+
+      // Unsigned node rejected by addSignedNode and by ByzantineHealer when requireSignatures=true
+      const unsignedNode = createDAGNode(aliceKey.publicKey(), 2, 2_000, randomBytes(16), [], {
+        [aliceKey.publicKey()]: 2,
+      });
+      expect(dag.addSignedNode(unsignedNode)).toBe(false);
+
+      const incoming = new MerkleDAG();
+      incoming.addNode(forgedByAttacker);
+      const healer = new ByzantineHealer();
+      const healRes = healer.heal(incoming, [], { requireSignatures: true });
+      expect(healRes.rejected.length).toBe(1);
+      expect(healRes.quarantined[0]?.reason).toBe('bad-signature');
+
+      // Ed25519 vector clock verification
+      const edClock = createEd25519VectorClock(aliceKey, 4, { bob: 2 });
+      expect(verifyEd25519VectorClock(edClock, aliceKey.publicKey())).toBe(true);
+      expect(verifyEd25519VectorClock(edClock, attackerKey.publicKey())).toBe(false);
+    });
+
+    it('compacts historical tombstones and saturated vector clocks with >= 60% storage reduction while preserving linearizable state', () => {
+      const aliceKey = Keypair.random();
+      const bobKey = Keypair.random();
+      const dag = new MerkleDAG();
+
+      // Build a saturated vector clock with 10 historical peers and 25 historical updates/tombstones
+      const baseClock: Record<string, number> = {
+        [aliceKey.publicKey()]: 1,
+        [bobKey.publicKey()]: 1,
+        retired_peer_1: 5,
+        retired_peer_2: 5,
+        retired_peer_3: 5,
+        retired_peer_4: 5,
+        retired_peer_5: 5,
+        retired_peer_6: 5,
+      };
+
+      let parents: string[] = [];
+      for (let i = 1; i <= 20; i++) {
+        const clock = { ...baseClock, [aliceKey.publicKey()]: i };
+        const isTombstone = i <= 14;
+        const milestoneId = isTombstone ? `temp-${i}` : `milestone-${(i % 2) + 1}`;
+        const status = isTombstone ? 'tombstone' : i >= 19 ? 'fulfilled' : 'pending';
+        const node = createSignedDAGNode(
+          aliceKey,
+          i,
+          1_000 + i * 100,
+          encodeMilestonePayload({
+            milestoneId,
+            status,
+            updatedAt: 1_000 + i * 100,
+            value: `step-${i}`,
+          }),
+          parents,
+          clock,
+          { isTombstone },
+        );
+        dag.addSignedNode(node);
+        parents = [node.hash];
+      }
+
+      const activePeers = new Set([aliceKey.publicKey(), bobKey.publicKey()]);
+      const signerMap = new Map([[aliceKey.publicKey(), aliceKey]]);
+
+      const stateBefore = dag.materializeMilestoneState();
+      const { beforeBytes, afterBytes, reductionRatio, compactedDAG, linearizableState } =
+        dag.compact({
+          activePeers,
+          signerKeypairs: signerMap,
+        });
+
+      expect(beforeBytes).toBeGreaterThan(afterBytes);
+      expect(reductionRatio).toBeGreaterThanOrEqual(0.6);
+
+      // Linearizable state before and after compaction must be identical
+      expect(linearizableState).toEqual(stateBefore);
+      expect(compactedDAG.materializeMilestoneState()).toEqual(stateBefore);
+      expect(linearizableState.get('milestone-1')?.status).toBe('fulfilled');
+      expect(linearizableState.get('milestone-2')?.status).toBe('fulfilled');
+
+      // Saturated clock pruning drops retired peers at or below causal floor
+      const prunedClock = pruneSaturatedVectorClock(baseClock, baseClock, activePeers);
+      expect(prunedClock.prunedPeers.length).toBeGreaterThanOrEqual(6);
+    });
+
+    it('reconciles divergent network partition branches via 3-way merge without losing valid milestones', () => {
+      const aliceKey = Keypair.random();
+      const bobKey = Keypair.random();
+      const alicePub = aliceKey.publicKey();
+      const bobPub = bobKey.publicKey();
+
+      // Shared genesis ancestor prior to network partition
+      const genesis = createSignedDAGNode(
+        aliceKey,
+        1,
+        1_000,
+        encodeMilestonePayload({
+          milestoneId: 'm-genesis',
+          status: 'fulfilled',
+          updatedAt: 1_000,
+        }),
+        [],
+        { [alicePub]: 1 },
+      );
+
+      const branchA = new MerkleDAG();
+      const branchB = new MerkleDAG();
+      branchA.addSignedNode(genesis);
+      branchB.addSignedNode(genesis);
+
+      // Partition Branch A: Alice fulfills m-alpha and leaves m-shared as pending
+      const a1 = createSignedDAGNode(
+        aliceKey,
+        2,
+        2_000,
+        encodeMilestonePayload({
+          milestoneId: 'm-alpha',
+          status: 'fulfilled',
+          updatedAt: 2_000,
+        }),
+        [genesis.hash],
+        { [alicePub]: 2 },
+      );
+      const a2 = createSignedDAGNode(
+        aliceKey,
+        3,
+        2_500,
+        encodeMilestonePayload({
+          milestoneId: 'm-shared',
+          status: 'pending',
+          updatedAt: 2_500,
+        }),
+        [a1.hash],
+        { [alicePub]: 3 },
+      );
+      branchA.addSignedNode(a1);
+      branchA.addSignedNode(a2);
+
+      // Partition Branch B: Bob fulfills m-beta and fulfills m-shared concurrently
+      const b1 = createSignedDAGNode(
+        bobKey,
+        1,
+        2_100,
+        encodeMilestonePayload({
+          milestoneId: 'm-beta',
+          status: 'fulfilled',
+          updatedAt: 2_100,
+        }),
+        [genesis.hash],
+        { [alicePub]: 1, [bobPub]: 1 },
+      );
+      const b2 = createSignedDAGNode(
+        bobKey,
+        2,
+        2_600,
+        encodeMilestonePayload({
+          milestoneId: 'm-shared',
+          status: 'fulfilled',
+          updatedAt: 2_600,
+        }),
+        [b1.hash],
+        { [alicePub]: 1, [bobPub]: 2 },
+      );
+      branchB.addSignedNode(b1);
+      branchB.addSignedNode(b2);
+
+      // Reconcile A <- B and B <- A
+      const mergeAB = branchA.reconcileThreeWay(branchB, { requireSignatures: true });
+      const mergeBA = branchB.reconcileThreeWay(branchA, { requireSignatures: true });
+
+      expect(mergeAB.rejectedNodes.length).toBe(0);
+      expect(mergeAB.lcaHash).toBe(genesis.hash);
+
+      // Both divergent branches converge to the exact same state without losing any valid milestone
+      expect(mergeAB.mergedMilestones).toEqual(mergeBA.mergedMilestones);
+      expect(mergeAB.mergedMilestones.get('m-genesis')?.status).toBe('fulfilled');
+      expect(mergeAB.mergedMilestones.get('m-alpha')?.status).toBe('fulfilled');
+      expect(mergeAB.mergedMilestones.get('m-beta')?.status).toBe('fulfilled');
+      expect(mergeAB.mergedMilestones.get('m-shared')?.status).toBe('fulfilled');
+    });
   });
 });
