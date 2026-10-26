@@ -1,8 +1,12 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
+#![allow(clippy::duplicated_attributes)]
 
 extern crate alloc;
 
+pub mod bisection;
+
+use crate::bisection::{BisectionGame, BisectionStatus};
 use crate::types::{CommitmentData, DataKey, MerkleProof, SequencerRecord};
 use crate::verifier::verify_merkle_fraud;
 use soroban_sdk::{contract, contractimpl, log, Address, BytesN, Env};
@@ -164,5 +168,81 @@ impl FraudVerifierContract {
     pub fn get_stake(env: Env) -> i128 {
         let record: Option<SequencerRecord> = env.storage().instance().get(&DataKey::Sequencer);
         record.map(|r| r.stake).unwrap_or(0)
+    }
+
+    /// Starts an interactive O(log N) bisection dispute game over `[0, total_steps]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_bisection_game(
+        env: Env,
+        challenger: Address,
+        batch_ledger_seq: u32,
+        total_steps: u32,
+        initial_state_root: BytesN<32>,
+        claimed_final_root: BytesN<32>,
+        challenger_bond: i128,
+        turn_timeout_ledgers: u32,
+    ) -> u64 {
+        bisection::start_bisection(
+            &env,
+            challenger,
+            batch_ledger_seq,
+            total_steps,
+            initial_state_root,
+            claimed_final_root,
+            challenger_bond,
+            turn_timeout_ledgers,
+            CHALLENGE_PERIOD_LEDGERS,
+        )
+    }
+
+    /// Sequencer submits the intermediate state root at the midpoint of the current disputed interval.
+    pub fn submit_midpoint_root(
+        env: Env,
+        sequencer: Address,
+        game_id: u64,
+        midpoint_root: BytesN<32>,
+    ) -> BisectionGame {
+        bisection::submit_midpoint(&env, sequencer, game_id, midpoint_root)
+    }
+
+    /// Challenger chooses whether to dispute the lower half (`challenge_lower_half == true`)
+    /// or the upper half (`challenge_lower_half == false`) of the interval.
+    pub fn choose_disputed_half(
+        env: Env,
+        challenger: Address,
+        game_id: u64,
+        challenge_lower_half: bool,
+    ) -> BisectionGame {
+        bisection::choose_half(&env, challenger, game_id, challenge_lower_half)
+    }
+
+    /// Executes single-instruction ZK transition & Merkle verification once the interval
+    /// converges to a single step (`high_step - low_step == 1`), slashing the dishonest party.
+    pub fn resolve_single_step(
+        env: Env,
+        caller: Address,
+        game_id: u64,
+        commitment: CommitmentData,
+        opcode: u32,
+        proof: MerkleProof,
+    ) -> BisectionStatus {
+        bisection::verify_single_step_and_resolve(
+            &env,
+            caller,
+            game_id,
+            &commitment,
+            opcode,
+            &proof,
+        )
+    }
+
+    /// Enforces turn-based chess clock timeout if an adversary fails to submit their move within deadline.
+    pub fn claim_bisection_timeout(env: Env, caller: Address, game_id: u64) -> BisectionStatus {
+        bisection::claim_timeout(&env, caller, game_id)
+    }
+
+    /// Returns the current state of an interactive bisection game.
+    pub fn get_bisection_game(env: Env, game_id: u64) -> BisectionGame {
+        bisection::get_game(&env, game_id)
     }
 }
