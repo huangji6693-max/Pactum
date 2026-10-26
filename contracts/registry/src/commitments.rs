@@ -1,6 +1,6 @@
 use soroban_sdk::{
-    contracttype, panic_with_error, Address, BytesN, Env, Map, Symbol, TryFromVal, TryIntoVal, Val,
-    Vec,
+    contracttype, panic_with_error, xdr::ToXdr, Address, Bytes, BytesN, Env, Map, Symbol,
+    TryFromVal, TryIntoVal, Val, Vec,
 };
 
 /// The default dispute window in seconds (7 days = 604,800 seconds).
@@ -226,6 +226,31 @@ pub enum DataKey {
     DisputeToken,
     /// Instance storage key for the contract admin address.
     Admin,
+    /// Instance storage key for the ordered pool of staked attestor addresses.
+    StakedAttestorPool,
+    /// Persistent storage key for the cryptographically bound VRF dispute panel
+    /// record assigned to a commitment ID.
+    DisputePanel(u64),
+}
+
+/// Cryptographically bound VRF dispute panel assignment for a commitment (Issue #308).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputePanelRecord {
+    /// Commitment ID that this panel is bound to.
+    pub commitment_id: u64,
+    /// Deterministic VRF seed derived at the dispute declaration ledger sequence.
+    pub vrf_seed: BytesN<32>,
+    /// Ledger sequence at which the dispute panel was derived and locked.
+    pub ledger_sequence: u32,
+    /// Ledger timestamp at which the dispute panel was derived and locked.
+    pub ledger_timestamp: u64,
+    /// Selected unique active staked attestors ordered by VRF sampling round.
+    pub panel: Vec<Address>,
+    /// Required M-of-N vote threshold for panel resolution.
+    pub vote_threshold: u32,
+    /// SHA-256 commitment binding `(commitment_id, vrf_seed, ledger_sequence, vote_threshold, panel)`.
+    pub binding_hash: BytesN<32>,
 }
 
 /// Running tally of arbitrator votes on a single disputed commitment.
@@ -818,4 +843,153 @@ pub fn create_batch(env: &soroban_sdk::Env, params: Vec<CommitmentParams>) -> Ve
 
     crate::reentrancy::exit(env);
     ids
+}
+
+/// Computes the deterministic SHA-256 cryptographic binding digest over a commitment's
+/// VRF dispute panel assignment parameters and selected attestor addresses.
+pub fn compute_panel_binding_hash(
+    env: &soroban_sdk::Env,
+    commitment_id: u64,
+    vrf_seed: &BytesN<32>,
+    ledger_sequence: u32,
+    vote_threshold: u32,
+    panel: &Vec<Address>,
+) -> BytesN<32> {
+    let mut preimage = Bytes::from_slice(env, b"PACTUM_PANEL_BINDING_V1");
+    preimage.extend_from_array(&commitment_id.to_be_bytes());
+    preimage.extend_from_array(&vrf_seed.to_array());
+    preimage.extend_from_array(&ledger_sequence.to_be_bytes());
+    preimage.extend_from_array(&vote_threshold.to_be_bytes());
+    preimage.extend_from_array(&panel.len().to_be_bytes());
+    for attestor in panel.iter() {
+        preimage.append(&attestor.to_xdr(env));
+    }
+    env.crypto().sha256(&preimage).into()
+}
+
+/// Derives a deterministic VRF seed at the current dispute ledger sequence, samples
+/// `panel_size` unique active staked attestors proportional to their stake weights
+/// (excluding the commitment's `issuer` and `counterparty`), locks their stakes if
+/// the commitment is in `Disputed` state, and cryptographically binds the panel to
+/// both `DataKey::Commitment(commitment_id)` and `DataKey::DisputePanel(commitment_id)`.
+pub fn assign_vrf_dispute_panel(
+    env: &soroban_sdk::Env,
+    commitment_id: u64,
+    panel_size: u32,
+    vote_threshold: u32,
+    declaration_entropy: &BytesN<32>,
+) -> DisputePanelRecord {
+    if panel_size == 0 || vote_threshold == 0 || vote_threshold > panel_size {
+        panic_with_error!(env, crate::errors::Error::ThresholdInvalid);
+    }
+
+    let mut commitment = get_commitment_record(env, commitment_id)
+        .unwrap_or_else(|| panic_with_error!(env, crate::errors::Error::CommitmentNotFound));
+
+    let vrf_seed = crate::staking::derive_vrf_dispute_seed(
+        env,
+        commitment_id,
+        &commitment.issuer,
+        &commitment.counterparty,
+        &commitment.terms_hash,
+        declaration_entropy,
+    );
+
+    let panel = crate::staking::select_vrf_stake_weighted_panel(
+        env,
+        &vrf_seed,
+        panel_size,
+        &commitment.issuer,
+        &commitment.counterparty,
+    );
+
+    if commitment.status == CommitmentStatus::Disputed {
+        for attestor in panel.iter() {
+            crate::staking::set_locked(env, &attestor, true);
+        }
+    }
+
+    commitment.attestors = panel.clone();
+    commitment.counters = Commitment::pack_counters(
+        env,
+        commitment.milestone_count(),
+        commitment.milestones_attested(),
+        commitment.late_milestones(),
+        vote_threshold,
+    );
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Commitment(commitment_id), &commitment);
+    env.storage().persistent().extend_ttl(
+        &DataKey::Commitment(commitment_id),
+        TTL_THRESHOLD_LEDGERS,
+        TTL_EXTEND_LEDGERS,
+    );
+
+    let ledger_sequence = env.ledger().sequence();
+    let ledger_timestamp = env.ledger().timestamp();
+    let binding_hash = compute_panel_binding_hash(
+        env,
+        commitment_id,
+        &vrf_seed,
+        ledger_sequence,
+        vote_threshold,
+        &panel,
+    );
+
+    let record = DisputePanelRecord {
+        commitment_id,
+        vrf_seed,
+        ledger_sequence,
+        ledger_timestamp,
+        panel,
+        vote_threshold,
+        binding_hash,
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::DisputePanel(commitment_id), &record);
+    env.storage().persistent().extend_ttl(
+        &DataKey::DisputePanel(commitment_id),
+        TTL_THRESHOLD_LEDGERS,
+        TTL_EXTEND_LEDGERS,
+    );
+
+    record
+}
+
+/// Retrieves the stored VRF dispute panel assignment record for `commitment_id`.
+pub fn get_dispute_panel_record(
+    env: &soroban_sdk::Env,
+    commitment_id: u64,
+) -> Option<DisputePanelRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DisputePanel(commitment_id))
+}
+
+/// Verifies that a commitment's active voting panel matches its cryptographically
+/// bound `DisputePanelRecord` in persistent storage.
+pub fn verify_dispute_panel_binding(env: &soroban_sdk::Env, commitment_id: u64) -> bool {
+    let Some(commitment) = get_commitment_record(env, commitment_id) else {
+        return false;
+    };
+    let Some(record) = get_dispute_panel_record(env, commitment_id) else {
+        return false;
+    };
+    if commitment.attestors != record.panel || commitment.vote_threshold() != record.vote_threshold
+    {
+        return false;
+    }
+    let expected = compute_panel_binding_hash(
+        env,
+        record.commitment_id,
+        &record.vrf_seed,
+        record.ledger_sequence,
+        record.vote_threshold,
+        &record.panel,
+    );
+    expected == record.binding_hash
 }

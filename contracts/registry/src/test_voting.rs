@@ -422,3 +422,276 @@ fn test_vote_balance_unaffected_by_threshold_vote() {
 
     assert_eq!(token_client.balance(&client.address), vault_before);
 }
+
+#[test]
+fn test_vrf_panel_selection_zero_duplicates_and_excludes_conflicted_parties() {
+    let env = Env::default();
+    let (client, token, _arbitrator, _admin, issuer, counterparty, attestors) = setup_voting(&env);
+
+    // Even if issuer and counterparty stake as attestors, they must be excluded from VRF selection.
+    let asset = StellarAssetClient::new(&env, &token);
+    asset.mint(&issuer, &(STAKE * 10));
+    asset.mint(&counterparty, &(STAKE * 10));
+    client.stake_attestor(&issuer, &(STAKE * 5));
+    client.stake_attestor(&counterparty, &(STAKE * 5));
+
+    // Also add one attestor who initiates unbonding; unbonding attestors must be excluded.
+    let unbonding_attestor = Address::generate(&env);
+    asset.mint(&unbonding_attestor, &(STAKE * 2));
+    client.stake_attestor(&unbonding_attestor, &STAKE);
+    client.request_unstake(&unbonding_attestor);
+
+    let terms = BytesN::from_array(&env, &[0xAB; 32]);
+
+    for trial in 0u32..40 {
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 10_000 + trial;
+            l.timestamp = T0 + (trial as u64) * 5;
+        });
+
+        let entropy = BytesN::from_array(&env, &[trial as u8; 32]);
+        let panel = env.as_contract(&client.address, || {
+            let seed = crate::staking::derive_vrf_dispute_seed(
+                &env,
+                u64::from(trial + 1),
+                &issuer,
+                &counterparty,
+                &terms,
+                &entropy,
+            );
+            crate::staking::select_vrf_stake_weighted_panel(&env, &seed, 4, &issuer, &counterparty)
+        });
+
+        assert_eq!(panel.len(), 4);
+
+        // Verify zero duplicate attestors and no conflicted or unbonding parties.
+        for i in 0..panel.len() {
+            let member_i = panel.get(i).unwrap();
+            assert_ne!(member_i, issuer);
+            assert_ne!(member_i, counterparty);
+            assert_ne!(member_i, unbonding_attestor);
+            assert!(attestors.contains(&member_i));
+            for j in (i + 1)..panel.len() {
+                let member_j = panel.get(j).unwrap();
+                assert_ne!(member_i, member_j, "duplicate attestor in VRF panel");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_vrf_panel_selection_stake_proportional_distribution() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(RegistryContract, ());
+    let client = RegistryContractClient::new(&env, &contract_id);
+
+    let arbitrator = Address::generate(&env);
+    let admin = Address::generate(&env);
+    client.initialize(&soroban_sdk::vec![&env, arbitrator.clone()], &admin);
+
+    let token = env
+        .register_stellar_asset_contract_v2(arbitrator.clone())
+        .address();
+    client.set_staking_token(&arbitrator, &token);
+
+    let asset = StellarAssetClient::new(&env, &token);
+    let low_stake_attestor = Address::generate(&env);
+    let mid_stake_attestor = Address::generate(&env);
+    let high_stake_attestor = Address::generate(&env);
+
+    // Stake weights: 100 (10%), 300 (30%), 600 (60%) => total 1,000.
+    asset.mint(&low_stake_attestor, &100);
+    asset.mint(&mid_stake_attestor, &300);
+    asset.mint(&high_stake_attestor, &600);
+    client.stake_attestor(&low_stake_attestor, &100);
+    client.stake_attestor(&mid_stake_attestor, &300);
+    client.stake_attestor(&high_stake_attestor, &600);
+
+    let issuer = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    let terms = BytesN::from_array(&env, &[0x42; 32]);
+
+    let mut low_count: u32 = 0;
+    let mut mid_count: u32 = 0;
+    let mut high_count: u32 = 0;
+    let trials: u32 = 300;
+
+    for i in 0..trials {
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 50_000 + i;
+            l.timestamp = T0 + u64::from(i) * 5;
+        });
+        let entropy = BytesN::from_array(&env, &[(i & 0xFF) as u8; 32]);
+        let selected = env.as_contract(&client.address, || {
+            let seed = crate::staking::derive_vrf_dispute_seed(
+                &env,
+                u64::from(i + 1),
+                &issuer,
+                &counterparty,
+                &terms,
+                &entropy,
+            );
+            crate::staking::select_vrf_stake_weighted_panel(&env, &seed, 1, &issuer, &counterparty)
+        });
+        let winner = selected.get(0).unwrap();
+        if winner == low_stake_attestor {
+            low_count += 1;
+        } else if winner == mid_stake_attestor {
+            mid_count += 1;
+        } else if winner == high_stake_attestor {
+            high_count += 1;
+        } else {
+            panic!("unexpected attestor selected");
+        }
+    }
+
+    assert_eq!(low_count + mid_count + high_count, trials);
+    // Expected counts over 300 trials: ~30 (low), ~90 (mid), ~180 (high).
+    // Verify monotonic stake-proportional ordering and statistically sound bounds.
+    assert!(
+        high_count > mid_count && mid_count > low_count,
+        "expected high ({high_count}) > mid ({mid_count}) > low ({low_count})"
+    );
+    assert!((10..=60).contains(&low_count), "low_count={low_count}");
+    assert!((55..=130).contains(&mid_count), "mid_count={mid_count}");
+    assert!((140..=230).contains(&high_count), "high_count={high_count}");
+}
+
+#[test]
+fn test_vrf_seed_unpredictability_across_ledger_sequences_and_disputes() {
+    let env = Env::default();
+    let (client, _token, _arbitrator, _admin, issuer, counterparty, _attestors) =
+        setup_voting(&env);
+    let terms = BytesN::from_array(&env, &[0x11; 32]);
+    let entropy_a = BytesN::from_array(&env, &[0x01; 32]);
+    let entropy_b = BytesN::from_array(&env, &[0x02; 32]);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 777;
+        l.timestamp = T0;
+    });
+
+    let (seed_base, seed_replay, seed_diff_commitment, seed_diff_entropy) =
+        env.as_contract(&client.address, || {
+            let s1 = crate::staking::derive_vrf_dispute_seed(
+                &env,
+                1,
+                &issuer,
+                &counterparty,
+                &terms,
+                &entropy_a,
+            );
+            let s1_again = crate::staking::derive_vrf_dispute_seed(
+                &env,
+                1,
+                &issuer,
+                &counterparty,
+                &terms,
+                &entropy_a,
+            );
+            let s_cid = crate::staking::derive_vrf_dispute_seed(
+                &env,
+                2,
+                &issuer,
+                &counterparty,
+                &terms,
+                &entropy_a,
+            );
+            let s_ent = crate::staking::derive_vrf_dispute_seed(
+                &env,
+                1,
+                &issuer,
+                &counterparty,
+                &terms,
+                &entropy_b,
+            );
+            (s1, s1_again, s_cid, s_ent)
+        });
+
+    assert_eq!(seed_base, seed_replay);
+    assert_ne!(seed_base, seed_diff_commitment);
+    assert_ne!(seed_base, seed_diff_entropy);
+
+    // Advance ledger sequence by 1: seed must change unpredictably.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 778;
+    });
+    let seed_next_ledger = env.as_contract(&client.address, || {
+        crate::staking::derive_vrf_dispute_seed(&env, 1, &issuer, &counterparty, &terms, &entropy_a)
+    });
+    assert_ne!(seed_base, seed_next_ledger);
+}
+
+#[test]
+fn test_vrf_commitment_panel_cryptographic_binding_and_end_to_end_voting() {
+    let env = Env::default();
+    let (client, _token, arbitrator, _admin, issuer, counterparty, _attestors) = setup_voting(&env);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 9_001;
+        l.timestamp = T0;
+    });
+
+    // Create a commitment initially without a static panel, then attest & dispute it.
+    let empty_panel = Vec::new(&env);
+    let terms = BytesN::from_array(&env, &[0x55; 32]);
+    let id = client.create_commitment(
+        &issuer,
+        &counterparty,
+        &terms,
+        &(T0 + 600),
+        &arbitrator,
+        &None,
+        &None,
+        &empty_panel,
+        &0,
+    );
+    client.attest(&issuer, &id, &CommitmentStatus::Fulfilled);
+    client.dispute(&counterparty, &id);
+
+    // Assign a 3-member VRF committee with threshold = 2 at dispute block sequence 9_001.
+    let entropy = BytesN::from_array(&env, &[0x99; 32]);
+    let record = env.as_contract(&client.address, || {
+        crate::commitments::assign_vrf_dispute_panel(&env, id, 3, 2, &entropy)
+    });
+
+    assert_eq!(record.commitment_id, id);
+    assert_eq!(record.ledger_sequence, 9_001);
+    assert_eq!(record.vote_threshold, 2);
+    assert_eq!(record.panel.len(), 3);
+
+    // Cryptographic binding verification must succeed and match commitment storage.
+    let binding_ok = env.as_contract(&client.address, || {
+        crate::commitments::verify_dispute_panel_binding(&env, id)
+    });
+    assert!(binding_ok);
+
+    let commitment = client.get_commitment(&id);
+    assert_eq!(commitment.attestors, record.panel);
+    assert_eq!(commitment.vote_threshold(), 2);
+
+    // All 3 selected committee members have their stakes locked while the dispute is active.
+    let m0 = record.panel.get(0).unwrap();
+    let m1 = record.panel.get(1).unwrap();
+    let m2 = record.panel.get(2).unwrap();
+    assert!(client.get_stake_info(&m0).locked);
+    assert!(client.get_stake_info(&m1).locked);
+    assert!(client.get_stake_info(&m2).locked);
+
+    // Cast M-of-N votes (m0 and m2 vote Breached, m1 dissents with Fulfilled).
+    client.cast_dispute_vote(&m0, &id, &CommitmentStatus::Breached);
+    client.cast_dispute_vote(&m1, &id, &CommitmentStatus::Fulfilled);
+    client.cast_dispute_vote(&m2, &id, &CommitmentStatus::Breached);
+
+    // Dispute resolves to Breached, dissenter m1 is slashed 10%, and all 3 are unlocked.
+    let resolved = client.get_commitment(&id);
+    assert_eq!(resolved.status, CommitmentStatus::Breached);
+    assert!(!client.get_stake_info(&m0).locked);
+    assert!(!client.get_stake_info(&m1).locked);
+    assert!(!client.get_stake_info(&m2).locked);
+    assert_eq!(client.get_stake_info(&m0).staked, STAKE);
+    assert_eq!(client.get_stake_info(&m1).staked, STAKE - STAKE / 10);
+    assert_eq!(client.get_stake_info(&m2).staked, STAKE);
+}

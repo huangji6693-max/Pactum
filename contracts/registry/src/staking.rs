@@ -10,7 +10,10 @@
 use crate::commitments::{DataKey, TTL_EXTEND_LEDGERS, TTL_THRESHOLD_LEDGERS};
 use crate::errors::Error;
 use crate::{events, reentrancy};
-use soroban_sdk::{contracttype, panic_with_error, token::TokenClient, Address, Env};
+use soroban_sdk::{
+    contracttype, panic_with_error, token::TokenClient, xdr::ToXdr, Address, Bytes, BytesN, Env,
+    Vec,
+};
 
 /// The unbonding period in seconds (14 days = 1,209,600 seconds). A requested
 /// unstake becomes withdrawable only after this period has elapsed.
@@ -160,6 +163,7 @@ pub fn stake_attestor(env: &Env, attestor: Address, amount: i128) {
         .checked_add(amount)
         .unwrap_or_else(|| panic_with_error!(env, Error::Overflow));
     save_stake(env, &attestor, &stake);
+    register_in_staked_pool(env, &attestor);
 
     // 5. Transfer the asset from the attestor into the contract vault.
     let client = TokenClient::new(env, &token);
@@ -257,6 +261,7 @@ pub fn finalize_unstake(env: &Env, attestor: Address) {
     env.storage()
         .persistent()
         .remove(&DataKey::Stake(attestor.clone()));
+    unregister_from_staked_pool(env, &attestor);
 
     // 4. Transfer the asset from the contract vault back to the attestor.
     let token = staking_token(env);
@@ -284,4 +289,192 @@ pub fn get_stake_info(env: &Env, attestor: Address) -> AttestorStake {
         );
     }
     load_stake(env, &attestor)
+}
+
+/// Ensures `attestor` is recorded in the ordered active staked attestor pool (`DataKey::StakedAttestorPool`).
+fn register_in_staked_pool(env: &Env, attestor: &Address) {
+    let mut pool: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::StakedAttestorPool)
+        .unwrap_or_else(|| Vec::new(env));
+    if !pool.contains(attestor) {
+        pool.push_back(attestor.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::StakedAttestorPool, &pool);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+    }
+}
+
+/// Removes `attestor` from the ordered active staked attestor pool (`DataKey::StakedAttestorPool`).
+fn unregister_from_staked_pool(env: &Env, attestor: &Address) {
+    let pool: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::StakedAttestorPool)
+        .unwrap_or_else(|| Vec::new(env));
+    let mut updated = Vec::new(env);
+    for addr in pool.iter() {
+        if addr != *attestor {
+            updated.push_back(addr);
+        }
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::StakedAttestorPool, &updated);
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+}
+
+/// Returns all currently eligible staked attestors `(address, staked_balance)` from the
+/// registry pool who have positive stake, are not unbonding, and are not conflicted
+/// commitment parties (`exclude_issuer` or `exclude_counterparty`).
+pub fn active_staked_attestors(
+    env: &Env,
+    exclude_issuer: &Address,
+    exclude_counterparty: &Address,
+) -> Vec<(Address, i128)> {
+    let pool: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::StakedAttestorPool)
+        .unwrap_or_else(|| Vec::new(env));
+    let mut active = Vec::new(env);
+    for addr in pool.iter() {
+        if addr == *exclude_issuer || addr == *exclude_counterparty {
+            continue;
+        }
+        let stake = load_stake(env, &addr);
+        if stake.staked > 0 && stake.unbonding_until.is_none() {
+            active.push_back((addr, stake.staked));
+        }
+    }
+    active
+}
+
+/// Derives a verifiable random function (VRF) seed for dispute committee selection
+/// using Stellar ledger state (`sequence`, `timestamp`, `network_id`) combined with
+/// commitment-specific dispute declaration parameters (`commitment_id`, `issuer`,
+/// `counterparty`, `terms_hash`, `declaration_entropy`).
+///
+/// Because `env.ledger().sequence()` and `env.ledger().timestamp()` are fixed by
+/// Stellar consensus only when the dispute transaction is included in a ledger block,
+/// parties cannot pre-compute or manipulate the resulting committee prior to the
+/// dispute declaration block sequence.
+pub fn derive_vrf_dispute_seed(
+    env: &Env,
+    commitment_id: u64,
+    issuer: &Address,
+    counterparty: &Address,
+    terms_hash: &BytesN<32>,
+    declaration_entropy: &BytesN<32>,
+) -> BytesN<32> {
+    let mut preimage = Bytes::from_slice(env, b"PACTUM_VRF_DISPUTE_SEED_V1");
+    preimage.extend_from_array(&env.ledger().sequence().to_be_bytes());
+    preimage.extend_from_array(&env.ledger().timestamp().to_be_bytes());
+    preimage.extend_from_array(&env.ledger().network_id().to_array());
+    preimage.extend_from_array(&commitment_id.to_be_bytes());
+    preimage.append(&issuer.to_xdr(env));
+    preimage.append(&counterparty.to_xdr(env));
+    preimage.extend_from_array(&terms_hash.to_array());
+    preimage.extend_from_array(&declaration_entropy.to_array());
+    env.crypto().sha256(&preimage).into()
+}
+
+/// Samples a uniform random integer in `[0, bound)` without modulo bias using
+/// rejection sampling over SHA-256 counter-mode blocks derived from `vrf_seed`.
+fn sample_unbiased_u128(env: &Env, vrf_seed: &BytesN<32>, round: u32, bound: u128) -> u128 {
+    if bound <= 1 {
+        return 0;
+    }
+    // Largest multiple of `bound` that fits in `u128::MAX` to eliminate modulo bias.
+    let zone = u128::MAX - (u128::MAX % bound);
+    let mut attempt: u32 = 0;
+    loop {
+        let mut block = Bytes::from_slice(env, b"PACTUM_VRF_DRAW_V1");
+        block.extend_from_array(&vrf_seed.to_array());
+        block.extend_from_array(&round.to_be_bytes());
+        block.extend_from_array(&attempt.to_be_bytes());
+        let digest: BytesN<32> = env.crypto().sha256(&block).into();
+        let arr = digest.to_array();
+        let mut raw_bytes = [0u8; 16];
+        raw_bytes.copy_from_slice(&arr[0..16]);
+        let candidate = u128::from_be_bytes(raw_bytes);
+        if candidate < zone {
+            return candidate % bound;
+        }
+        attempt = attempt.wrapping_add(1);
+    }
+}
+
+/// Selects `panel_size` unique attestors from the active staked pool proportional
+/// to their staked balance without replacement using the provided `vrf_seed`.
+///
+/// # Panics
+/// * Panics with `Error::ThresholdInvalid` if `panel_size == 0`.
+/// * Panics with `Error::InsufficientStake` if fewer than `panel_size` eligible
+///   active staked attestors exist in the pool.
+pub fn select_vrf_stake_weighted_panel(
+    env: &Env,
+    vrf_seed: &BytesN<32>,
+    panel_size: u32,
+    exclude_issuer: &Address,
+    exclude_counterparty: &Address,
+) -> Vec<Address> {
+    if panel_size == 0 {
+        panic_with_error!(env, Error::ThresholdInvalid);
+    }
+
+    let candidates = active_staked_attestors(env, exclude_issuer, exclude_counterparty);
+    if candidates.len() < panel_size {
+        panic_with_error!(env, Error::InsufficientStake);
+    }
+
+    let mut remaining = candidates;
+    let mut selected = Vec::new(env);
+
+    for round in 0..panel_size {
+        let mut total_weight: u128 = 0;
+        for (_, stake_amt) in remaining.iter() {
+            let weight = u128::try_from(stake_amt)
+                .unwrap_or_else(|_| panic_with_error!(env, Error::Overflow));
+            total_weight = total_weight
+                .checked_add(weight)
+                .unwrap_or_else(|| panic_with_error!(env, Error::Overflow));
+        }
+
+        if total_weight == 0 {
+            panic_with_error!(env, Error::InsufficientStake);
+        }
+
+        let target = sample_unbiased_u128(env, vrf_seed, round, total_weight);
+
+        let mut cumulative: u128 = 0;
+        let mut chosen_index: u32 = 0;
+        for (idx, (_, stake_amt)) in remaining.iter().enumerate() {
+            let weight = u128::try_from(stake_amt).unwrap_or(0);
+            cumulative = cumulative.saturating_add(weight);
+            if target < cumulative {
+                chosen_index = idx as u32;
+                break;
+            }
+        }
+
+        let (chosen_addr, _) = remaining.get(chosen_index).unwrap();
+        selected.push_back(chosen_addr);
+
+        let mut next_remaining = Vec::new(env);
+        for (idx, entry) in remaining.iter().enumerate() {
+            if (idx as u32) != chosen_index {
+                next_remaining.push_back(entry);
+            }
+        }
+        remaining = next_remaining;
+    }
+
+    selected
 }
