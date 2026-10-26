@@ -63,8 +63,29 @@ export class MeshServiceWorkerCoordinator {
   }
 
   private handleWorkerMessage(data: any): void {
-    if (data && data.type === 'SOROBAN_EVENT_DISSEMINATED' && data.event) {
+    if (!data || typeof data !== 'object') return;
+    if (data.type === 'SOROBAN_EVENT_DISSEMINATED' && data.event) {
       this.notifyListeners(data.event);
+    } else if (data.type === 'MESH_STATE_SNAPSHOT' && Array.isArray(data.events)) {
+      for (const ev of data.events) {
+        this.notifyListeners(ev);
+      }
+      if (this.transport && Array.isArray(data.blacklistedPeers)) {
+        for (const peerId of data.blacklistedPeers) {
+          this.transport.scoring.slashPeer(peerId, 'Restored from Service Worker blacklist');
+        }
+      }
+    } else if (data.type === 'PEER_SLASHED' && data.peerId && this.transport) {
+      this.transport.scoring.slashPeer(data.peerId, data.reason || 'Slashed via Service Worker');
+    }
+  }
+
+  public requestStateHydration(knownEventIds: string[] = []): void {
+    if (typeof navigator !== 'undefined' && navigator.serviceWorker?.controller) {
+      navigator.serviceWorker.controller.postMessage({
+        type: 'CLIENT_NAVIGATION_HYDRATE',
+        knownEventIds,
+      });
     }
   }
 

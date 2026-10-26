@@ -3,10 +3,13 @@ import type {
   IHaveMessage,
   GraftMessage,
   PruneMessage,
+  AntiEntropyReqMessage,
+  AntiEntropyRespMessage,
   MeshProtocolMessage,
   SorobanIndexedEvent,
 } from './types.ts';
 import { PeerScoringManager } from './peerScoring.ts';
+import type { AntiEntropyManager } from './antiEntropy.ts';
 
 export interface PlumtreeConfig {
   localPeerId: string;
@@ -16,23 +19,29 @@ export interface PlumtreeConfig {
   iHaveIntervalMs?: number;
   graftTimeoutMs?: number;
   messageCacheTtlMs?: number;
+  maxHopCount?: number;
 }
 
 export type SendMessageHandler = (targetPeerId: string, message: MeshProtocolMessage) => void;
 export type MessageDeliveryHandler = (event: SorobanIndexedEvent, senderPeerId: string) => void;
+export type DisconnectPeerHandler = (peerId: string, reason: string) => void;
 
 export class PlumtreeEngine {
   public localPeerId: string;
   private eagerNeighbors: Set<string> = new Set();
   private lazyNeighbors: Set<string> = new Set();
   private seenMessages: Map<string, number> = new Map(); // messageId -> timestamp
+  private eventCache: Map<string, SorobanIndexedEvent> = new Map(); // messageId -> event
   private graftTimers: Map<string, { timer: any; peerId: string }> = new Map(); // messageId -> timer info
   private pendingIHave: Set<string> = new Set(); // messageIds awaiting lazy broadcast
   private iHaveInterval: any = null;
+  private unsubscribeSlash?: () => void;
 
   public scoring: PeerScoringManager;
+  private antiEntropy?: AntiEntropyManager;
   private sendMessage: SendMessageHandler;
   private onDeliver: MessageDeliveryHandler;
+  private onDisconnect?: DisconnectPeerHandler;
   private config: Required<PlumtreeConfig>;
 
   // Metrics
@@ -46,11 +55,13 @@ export class PlumtreeEngine {
     scoring: PeerScoringManager,
     sendMessage: SendMessageHandler,
     onDeliver: MessageDeliveryHandler,
+    onDisconnect?: DisconnectPeerHandler,
   ) {
     this.localPeerId = config.localPeerId;
     this.scoring = scoring;
     this.sendMessage = sendMessage;
     this.onDeliver = onDeliver;
+    this.onDisconnect = onDisconnect;
 
     this.config = {
       localPeerId: config.localPeerId,
@@ -60,16 +71,33 @@ export class PlumtreeEngine {
       iHaveIntervalMs: config.iHaveIntervalMs ?? 300,
       graftTimeoutMs: config.graftTimeoutMs ?? 150,
       messageCacheTtlMs: config.messageCacheTtlMs ?? 5 * 60 * 1000,
+      maxHopCount: config.maxHopCount ?? 12,
     };
+
+    // Automatically evict & disconnect peers immediately upon slashing or ban
+    this.unsubscribeSlash = this.scoring.onPeerSlashed((peerId, reason) => {
+      this.evictPeer(peerId, reason);
+    });
 
     this.startIHaveLoop();
   }
 
   /**
-   * Registers a newly connected peer into the lazy overlay.
+   * Attaches an AntiEntropyManager so ANTI_ENTROPY_REQ and ANTI_ENTROPY_RESP frames
+   * routed through Plumtree are automatically reconciled and delivered.
+   */
+  public attachAntiEntropy(antiEntropy: AntiEntropyManager): void {
+    this.antiEntropy = antiEntropy;
+  }
+
+  /**
+   * Registers a newly connected peer into the overlay.
    */
   public addPeer(peerId: string): void {
-    if (peerId === this.localPeerId) return;
+    if (!peerId || peerId === this.localPeerId) return;
+    if (this.scoring.isPeerBanned(peerId) || this.scoring.isBlacklisted(peerId)) {
+      return;
+    }
 
     if (this.eagerNeighbors.has(peerId) || this.lazyNeighbors.has(peerId)) {
       return;
@@ -87,7 +115,7 @@ export class PlumtreeEngine {
   }
 
   /**
-   * Removes a disconnected peer from all overlays.
+   * Removes a disconnected peer from all overlays and rebalances eager fanout.
    */
   public removePeer(peerId: string): void {
     this.eagerNeighbors.delete(peerId);
@@ -98,11 +126,26 @@ export class PlumtreeEngine {
   }
 
   /**
+   * Evicts a Byzantine/banned peer from overlays and triggers transport disconnection.
+   */
+  public evictPeer(peerId: string, reason: string = 'Peer banned'): void {
+    const wasPresent = this.eagerNeighbors.has(peerId) || this.lazyNeighbors.has(peerId);
+    this.eagerNeighbors.delete(peerId);
+    this.lazyNeighbors.delete(peerId);
+    if (wasPresent) {
+      this.rebalanceOverlays();
+    }
+    this.onDisconnect?.(peerId, reason);
+  }
+
+  /**
    * Publishes a new locally-indexed Soroban event to the gossip mesh.
    */
   public publishEvent(event: SorobanIndexedEvent): void {
     const messageId = event.id;
     this.seenMessages.set(messageId, Date.now());
+    this.eventCache.set(messageId, event);
+    this.antiEntropy?.recordEvent(event);
 
     const message: GossipDataMessage = {
       type: 'GOSSIP_DATA',
@@ -130,7 +173,14 @@ export class PlumtreeEngine {
    * Ingests and processes an incoming protocol message.
    */
   public handleMessage(senderPeerId: string, message: MeshProtocolMessage): void {
-    if (this.scoring.isPeerBanned(senderPeerId)) {
+    if (this.scoring.isPeerBanned(senderPeerId) || this.scoring.isBlacklisted(senderPeerId)) {
+      this.evictPeer(senderPeerId, 'Peer is blacklisted');
+      return;
+    }
+
+    if (!message || typeof message !== 'object' || typeof message.type !== 'string') {
+      this.byzantineDroppedCount++;
+      this.scoring.slashPeer(senderPeerId, 'Malformed protocol message envelope');
       return;
     }
 
@@ -147,6 +197,12 @@ export class PlumtreeEngine {
       case 'PRUNE':
         this.handlePrune(senderPeerId, message);
         break;
+      case 'ANTI_ENTROPY_REQ':
+        this.handleAntiEntropyReq(senderPeerId, message);
+        break;
+      case 'ANTI_ENTROPY_RESP':
+        this.handleAntiEntropyResp(senderPeerId, message);
+        break;
       default:
         break;
     }
@@ -155,11 +211,30 @@ export class PlumtreeEngine {
   private handleGossipData(senderPeerId: string, msg: GossipDataMessage): void {
     this.messagesReceivedCount++;
 
+    // Detect Sybil routing loop / invalid hop count
+    if (
+      typeof msg.hopCount !== 'number' ||
+      msg.hopCount < 0 ||
+      msg.hopCount > this.config.maxHopCount ||
+      !msg.messageId
+    ) {
+      this.byzantineDroppedCount++;
+      this.scoring.slashPeer(senderPeerId, 'Invalid hopCount or missing messageId in GOSSIP_DATA');
+      return;
+    }
+
     // 1. Validate event structure & cryptographic integrity
     const validation = this.scoring.validateSorobanEvent(msg.event);
     if (!validation.isValid) {
       this.byzantineDroppedCount++;
-      this.scoring.recordInvalidMessage(senderPeerId, validation.isByzantine);
+      if (validation.isByzantine) {
+        this.scoring.slashPeer(
+          senderPeerId,
+          validation.reason ?? 'Malformed or Byzantine Soroban event injection',
+        );
+      } else {
+        this.scoring.recordInvalidMessage(senderPeerId, false, validation.reason);
+      }
       return;
     }
 
@@ -173,12 +248,23 @@ export class PlumtreeEngine {
     }
 
     if (!isDuplicate) {
-      // Novel message
-      this.seenMessages.set(msg.messageId, Date.now());
-      this.scoring.recordValidMessage(senderPeerId);
+      const now = Date.now();
+      const deliveryLatencyMs =
+        typeof msg.timestamp === 'number' && msg.timestamp <= now
+          ? now - msg.timestamp
+          : undefined;
 
-      // Ensure sender is on eager overlay
-      if (this.lazyNeighbors.has(senderPeerId)) {
+      // Novel message
+      this.seenMessages.set(msg.messageId, now);
+      this.eventCache.set(msg.messageId, msg.event);
+      this.antiEntropy?.recordEvent(msg.event);
+      this.scoring.recordValidMessage(senderPeerId, deliveryLatencyMs);
+
+      // Ensure sender is on eager overlay if eligible
+      if (
+        this.lazyNeighbors.has(senderPeerId) &&
+        this.scoring.isPeerEligibleForEagerGossip(senderPeerId)
+      ) {
         this.lazyNeighbors.delete(senderPeerId);
         this.eagerNeighbors.add(senderPeerId);
       }
@@ -222,6 +308,12 @@ export class PlumtreeEngine {
   }
 
   private handleIHave(senderPeerId: string, msg: IHaveMessage): void {
+    if (!Array.isArray(msg.messageIds)) {
+      this.byzantineDroppedCount++;
+      this.scoring.slashPeer(senderPeerId, 'Malformed IHAVE messageIds array');
+      return;
+    }
+
     for (const msgId of msg.messageIds) {
       if (!this.seenMessages.has(msgId) && !this.graftTimers.has(msgId)) {
         // Start a graft timer: if message is not received via eager links within timeout, send GRAFT
@@ -237,12 +329,28 @@ export class PlumtreeEngine {
     }
   }
 
-  private handleGraft(senderPeerId: string, _msg: GraftMessage): void {
+  private handleGraft(senderPeerId: string, msg: GraftMessage): void {
+    if (this.scoring.isPeerBanned(senderPeerId)) return;
+
     // Promote sender from lazy to eager overlay
     this.lazyNeighbors.delete(senderPeerId);
     this.eagerNeighbors.add(senderPeerId);
 
-    // If a specific message was requested, we could resend if available in cache
+    // If a specific missing message was requested, replay it from local cache
+    if (msg.messageId && this.eventCache.has(msg.messageId)) {
+      const cachedEvent = this.eventCache.get(msg.messageId)!;
+      const replayMsg: GossipDataMessage = {
+        type: 'GOSSIP_DATA',
+        messageId: cachedEvent.id,
+        topic: cachedEvent.topic,
+        event: cachedEvent,
+        hopCount: 0,
+        senderId: this.localPeerId,
+        timestamp: Date.now(),
+      };
+      this.sendMessage(senderPeerId, replayMsg);
+      this.messagesRelayedCount++;
+    }
   }
 
   private handlePrune(senderPeerId: string, _msg: PruneMessage): void {
@@ -253,7 +361,37 @@ export class PlumtreeEngine {
     }
   }
 
+  private handleAntiEntropyReq(senderPeerId: string, msg: AntiEntropyReqMessage): void {
+    if (!this.antiEntropy) return;
+    const resp = this.antiEntropy.handleSyncRequest(msg);
+    this.sendMessage(senderPeerId, resp);
+  }
+
+  private handleAntiEntropyResp(senderPeerId: string, msg: AntiEntropyRespMessage): void {
+    if (!this.antiEntropy) return;
+    const reconciled = this.antiEntropy.handleSyncResponse(msg, (event) => {
+      if (!this.seenMessages.has(event.id)) {
+        this.seenMessages.set(event.id, Date.now());
+        this.eventCache.set(event.id, event);
+        this.onDeliver(event, senderPeerId);
+      }
+    });
+
+    if (reconciled.length > 0 && this.lazyNeighbors.has(senderPeerId)) {
+      // Promote helpful anti-entropy peer to heal partition
+      if (
+        this.eagerNeighbors.size < this.config.maxEagerFanout &&
+        this.scoring.isPeerEligibleForEagerGossip(senderPeerId)
+      ) {
+        this.lazyNeighbors.delete(senderPeerId);
+        this.eagerNeighbors.add(senderPeerId);
+      }
+    }
+  }
+
   private sendGraft(peerId: string, messageId?: string): void {
+    if (this.scoring.isPeerBanned(peerId)) return;
+
     // Promote to eager
     this.lazyNeighbors.delete(peerId);
     this.eagerNeighbors.add(peerId);
@@ -268,15 +406,14 @@ export class PlumtreeEngine {
   }
 
   private rebalanceOverlays(): void {
-    if (this.eagerNeighbors.size < this.config.minEagerFanout && this.lazyNeighbors.size > 0) {
+    while (this.eagerNeighbors.size < this.config.minEagerFanout && this.lazyNeighbors.size > 0) {
       const candidates = Array.from(this.lazyNeighbors).filter((p) =>
         this.scoring.isPeerEligibleForEagerGossip(p),
       );
 
-      if (candidates.length > 0) {
-        const promoted = candidates[Math.floor(Math.random() * candidates.length)];
-        this.sendGraft(promoted);
-      }
+      if (candidates.length === 0) break;
+      const promoted = candidates[Math.floor(Math.random() * candidates.length)];
+      this.sendGraft(promoted);
     }
   }
 
@@ -313,11 +450,16 @@ export class PlumtreeEngine {
     for (const [msgId, timestamp] of this.seenMessages.entries()) {
       if (now - timestamp > this.config.messageCacheTtlMs) {
         this.seenMessages.delete(msgId);
+        this.eventCache.delete(msgId);
       }
     }
   }
 
   public destroy(): void {
+    if (this.unsubscribeSlash) {
+      this.unsubscribeSlash();
+      this.unsubscribeSlash = undefined;
+    }
     if (this.iHaveInterval) {
       clearInterval(this.iHaveInterval);
       this.iHaveInterval = null;

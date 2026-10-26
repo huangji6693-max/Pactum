@@ -70,11 +70,15 @@ export interface AntiEntropyReqMessage extends BaseGossipMessage {
   type: 'ANTI_ENTROPY_REQ';
   fromLedger: number;
   toLedger: number;
+  merkleRoot?: string;
+  knownEventIds?: string[];
 }
 
 export interface AntiEntropyRespMessage extends BaseGossipMessage {
   type: 'ANTI_ENTROPY_RESP';
   events: SorobanIndexedEvent[];
+  merkleRoot?: string;
+  inSync?: boolean;
 }
 
 export type MeshProtocolMessage =
@@ -105,6 +109,9 @@ export interface PeerReputation {
   isQuarantined: boolean;
   isBanned: boolean;
   banExpiry?: number;
+  averageLatencyMs?: number;
+  duplicateRatio?: number;
+  slashedReason?: string;
 }
 
 export interface MeshTopologyStats {

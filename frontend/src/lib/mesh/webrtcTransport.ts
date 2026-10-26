@@ -59,6 +59,7 @@ export class WebRtcMeshTransport {
       (event, senderId) => {
         if (onEventDeliver) onEventDeliver(event, senderId);
       },
+      (peerId) => this.disconnectPeer(peerId),
     );
 
     this.initSignaling(config.signalingChannelName ?? 'pactum-webrtc-mesh-signaling');
@@ -269,7 +270,8 @@ export class WebRtcMeshTransport {
         this.handleIncomingMeshMessage(peerId, msg);
       } catch (err) {
         console.error(`Failed to decode mesh message from ${peerId}:`, err);
-        this.scoring.recordInvalidMessage(peerId, false);
+        this.scoring.slashPeer(peerId, 'Malformed JSON frame on WebRTC data channel');
+        this.disconnectPeer(peerId);
       }
     };
   }

@@ -4,7 +4,7 @@ import { PeerScoringManager } from '../peerScoring.ts';
 import type { SorobanIndexedEvent } from '../types.ts';
 
 describe('PeerScoringManager', () => {
-  it('rewards peer score on delivering valid messages', () => {
+  it('rewards peer score on delivering valid messages and tracks low delivery latency', () => {
     const manager = new PeerScoringManager();
     const peerId = 'peer-alice';
 
@@ -17,22 +17,38 @@ describe('PeerScoringManager', () => {
     rep = manager.getReputation(peerId);
     expect(rep.score).toBe(10);
     expect(rep.validMessagesDelivered).toBe(2);
+
+    manager.recordDeliveryLatency(peerId, 80); // fast delivery <= 150ms (+2)
+    expect(manager.getReputation(peerId).score).toBe(12);
+    expect(manager.getReputation(peerId).averageLatencyMs).toBe(80);
   });
 
-  it('penalizes duplicate messages and updates duplicate count', () => {
-    const manager = new PeerScoringManager();
+  it('penalizes duplicate messages, high duplicate ratios, and slow delivery latency', () => {
+    const manager = new PeerScoringManager({ maxDuplicateRatio: 0.5 });
     const peerId = 'peer-bob';
 
     manager.recordDuplicateMessage(peerId);
     const rep = manager.getReputation(peerId);
     expect(rep.score).toBe(-2);
     expect(rep.duplicateMessages).toBe(1);
+
+    // Trigger excess duplicate ratio penalty after >= 4 messages
+    manager.recordDuplicateMessage(peerId);
+    manager.recordDuplicateMessage(peerId);
+    manager.recordDuplicateMessage(peerId);
+    expect(manager.getDuplicateRatio(peerId)).toBe(1);
+    expect(manager.getReputation(peerId).score).toBeLessThan(-8);
+
+    manager.recordDeliveryLatency(peerId, 3500); // slow delivery >= 2000ms
+    expect(manager.getReputation(peerId).averageLatencyMs).toBeGreaterThan(0);
   });
 
-  it('quarantines and bans peers broadcasting invalid or Byzantine state', () => {
+  it('quarantines, slashes, and locally blacklists peers broadcasting invalid or Byzantine state', () => {
+    const slashedEvents: Array<{ peerId: string; reason: string }> = [];
     const manager = new PeerScoringManager({
       quarantineThreshold: -25,
       banThreshold: -50,
+      onPeerSlashed: (peerId, reason) => slashedEvents.push({ peerId, reason }),
     });
     const peerId = 'peer-malicious';
 
@@ -44,12 +60,15 @@ describe('PeerScoringManager', () => {
     expect(rep.isBanned).toBe(false);
     expect(manager.isPeerEligibleForEagerGossip(peerId)).toBe(false);
 
-    // Byzantine attack (-80) -> crosses ban threshold (-50)
+    // Byzantine attack (-80) -> crosses ban threshold (-50) and adds to blacklist
     manager.recordInvalidMessage(peerId, true);
     rep = manager.getReputation(peerId);
     expect(rep.score).toBe(-100);
     expect(rep.isBanned).toBe(true);
     expect(manager.isPeerBanned(peerId)).toBe(true);
+    expect(manager.isBlacklisted(peerId)).toBe(true);
+    expect(slashedEvents.length).toBe(1);
+    expect(slashedEvents[0].peerId).toBe(peerId);
   });
 
   it('validates Soroban events correctly', () => {
