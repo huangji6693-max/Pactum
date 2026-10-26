@@ -850,3 +850,243 @@ fn test_counterparty_without_history_scores_baseline() {
     assert_eq!(client.get_trust_score(&issuer).unwrap(), 60);
     assert_eq!(client.get_trust_score(&counterparty).unwrap(), 50);
 }
+
+// =============================================================================
+// Time-Weighted Average Reputation (TWAR) Segment Tree Tests (Issue #295)
+// =============================================================================
+
+use crate::reputation::{
+    decay_weight_q32, get_twar_score, half_life_decay, query_twar_range, update_twar_point,
+    TWARSegmentTree, TWAR_DEFAULT_HALF_LIFE_LEDGERS, TWAR_LEAF_CAPACITY, TWAR_OUTCOME_SCALE,
+    TWAR_PACKED_BYTES_LEN, TWAR_STORAGE_MAGIC,
+};
+use crate::trust_score::SCALE;
+
+#[test]
+fn test_twar_segment_tree_point_updates_and_range_queries() {
+    let mut tree = TWARSegmentTree::with_half_life(100_000);
+
+    // Populate distinct leaf buckets at the same anchor ledger (1_000).
+    tree.update_point(0, 1_000, 1_000);
+    tree.update_point(3, 2_500, 1_000);
+    tree.update_point(7, -500, 1_000);
+    tree.update_point(15, 4_000, 1_000);
+    tree.update_point(31, 3_000, 1_000);
+
+    assert_eq!(tree.query_point(0, 1_000), 1_000);
+    assert_eq!(tree.query_point(3, 1_000), 2_500);
+    assert_eq!(tree.query_point(7, 1_000), -500);
+    assert_eq!(tree.query_point(15, 1_000), 4_000);
+    assert_eq!(tree.query_point(31, 1_000), 3_000);
+
+    // Sub-range queries at ledger 1_000 (zero decay delta).
+    assert_eq!(tree.query_range(0, 3, 1_000), 3_500);
+    assert_eq!(tree.query_range(3, 7, 1_000), 2_000);
+    assert_eq!(tree.query_range(0, 15, 1_000), 7_000);
+    assert_eq!(tree.query_range(0, 31, 1_000), 10_000);
+    assert_eq!(tree.query_total(1_000), 10_000);
+
+    // Empty or inverted ranges return 0 safely.
+    assert_eq!(tree.query_range(8, 14, 1_000), 0);
+    assert_eq!(tree.query_range(10, 5, 1_000), 0);
+    assert_eq!(tree.query_range(64, 70, 1_000), 0);
+
+    // Query after exactly one half-life (ledger 101_000): every bucket halves.
+    assert_eq!(tree.query_range(0, 3, 101_000), 1_750);
+    assert_eq!(tree.query_range(0, 31, 101_000), 5_000);
+    assert_eq!(tree.query_total(101_000), 5_000);
+}
+
+#[test]
+fn test_twar_half_life_decay_exact_and_fractional_monotonic() {
+    let half_life = TWAR_DEFAULT_HALF_LIFE_LEDGERS; // 640,000 ledgers
+    let initial: i64 = 640_000;
+
+    // Exact power-of-two halving at integer multiples of half_life.
+    assert_eq!(half_life_decay(initial, 0, half_life), 640_000);
+    assert_eq!(half_life_decay(initial, half_life, half_life), 320_000);
+    assert_eq!(half_life_decay(initial, half_life * 2, half_life), 160_000);
+    assert_eq!(half_life_decay(initial, half_life * 3, half_life), 80_000);
+    assert_eq!(half_life_decay(initial, half_life * 4, half_life), 40_000);
+
+    // Symmetric decay for negative penalties.
+    assert_eq!(half_life_decay(-initial, half_life, half_life), -320_000);
+    assert_eq!(
+        half_life_decay(-initial, half_life * 2, half_life),
+        -160_000
+    );
+
+    // Fractional ledger deltas between 0 and 2 * half_life are strictly non-increasing.
+    let mut prev_weight = SCALE;
+    let step = half_life / 32;
+    for i in 1..=64 {
+        let delta = i * step;
+        let w = decay_weight_q32(delta, half_life);
+        assert!(
+            w <= prev_weight,
+            "decay weight increased from {prev_weight} to {w} at delta {delta}"
+        );
+        prev_weight = w;
+    }
+
+    // At 0.5 half-lives, 2^(-0.5) ≈ 0.70710678; verify polynomial accuracy within 0.4%.
+    let mid_decayed = half_life_decay(1_000_000, half_life / 2, half_life);
+    assert!(
+        (703_000..=711_000).contains(&mid_decayed),
+        "unexpected mid-half-life decay value: {mid_decayed}"
+    );
+}
+
+#[test]
+fn test_twar_packed_bytes_instance_storage_roundtrip() {
+    let (env, client, issuer, _counterparty) = setup();
+    let contract_id = client.address.clone();
+
+    env.as_contract(&contract_id, || {
+        update_twar_point(&env, &issuer, 2, 12_000_000, 5_000);
+        update_twar_point(&env, &issuer, 5, 8_000_000, 5_000);
+
+        let loaded = TWARSegmentTree::load(&env, &issuer);
+        assert_eq!(loaded.as_packed_slice().len(), TWAR_PACKED_BYTES_LEN);
+        assert_eq!(loaded.header().magic, TWAR_STORAGE_MAGIC);
+        assert_eq!(loaded.total_updates(), 2);
+        assert_eq!(loaded.last_ledger(), 5_000);
+
+        let range_val = query_twar_range(&env, &issuer, 0, 10, 5_000);
+        assert_eq!(range_val, 20_000_000);
+
+        // Advance ledger by one half-life in two 320,000-ledger steps (staying within
+        // Soroban's ~518,400-ledger max_entry_ttl per step) and verify decay.
+        env.ledger()
+            .with_mut(|l| l.sequence_number = 5_000 + TWAR_DEFAULT_HALF_LIFE_LEDGERS / 2);
+        env.storage().instance().extend_ttl(
+            crate::commitments::TTL_THRESHOLD_LEDGERS,
+            crate::commitments::TTL_EXTEND_LEDGERS,
+        );
+        env.ledger()
+            .with_mut(|l| l.sequence_number = 5_000 + TWAR_DEFAULT_HALF_LIFE_LEDGERS);
+        let decayed_range =
+            query_twar_range(&env, &issuer, 0, 10, 5_000 + TWAR_DEFAULT_HALF_LIFE_LEDGERS);
+        assert_eq!(decayed_range, 10_000_000);
+        assert_eq!(get_twar_score(&env, &issuer), 60);
+    });
+}
+
+#[test]
+fn test_twar_sequential_updates_and_outcome_scoring() {
+    let mut tree = TWARSegmentTree::new();
+    let half_life = TWAR_DEFAULT_HALF_LIFE_LEDGERS;
+
+    // Sequential updates across 64 consecutive buckets (wrapping around the 32-leaf ring).
+    for i in 0..64u32 {
+        let seq = 1_000 + i * 10_000;
+        tree.update_point(i, 10_000, seq);
+    }
+
+    assert_eq!(tree.total_updates(), 64);
+    assert_eq!(tree.last_ledger(), 1_000 + 63 * 10_000);
+
+    // Every leaf has 2 folded updates; the latest bucket (63 -> leaf 31) has anchor 631_000
+    // with its earlier update at 311_000 decayed by 320_000 ledgers (0.5 half-lives).
+    let leaf_31 = tree.query_point(31, 1_000 + 63 * 10_000);
+    assert!(leaf_31 > 17_000 && leaf_31 < 17_200);
+
+    // Verify high-level outcome recording & dispute retraction.
+    let mut outcome_tree = TWARSegmentTree::new();
+    outcome_tree.record_outcome(CommitmentStatus::Breached, true, 10_000);
+    assert_eq!(outcome_tree.twar_score(10_000), 0);
+
+    // After 1 half-life, breach penalty (-50) decays to -25 -> score 25.
+    assert_eq!(outcome_tree.twar_score(10_000 + half_life), 25);
+
+    // Retracting the breach restores the score to baseline 50.
+    outcome_tree.record_outcome(CommitmentStatus::Breached, false, 10_000 + half_life);
+    assert!(outcome_tree.twar_score(10_000 + half_life) >= 50);
+}
+
+#[test]
+fn test_twar_multi_year_ledger_jumps_decay_to_baseline() {
+    let mut tree = TWARSegmentTree::new();
+    let half_life = TWAR_DEFAULT_HALF_LIFE_LEDGERS;
+
+    // Record heavy breaches and fulfills at early ledgers.
+    tree.record_outcome(CommitmentStatus::Breached, true, 1_000);
+    tree.record_outcome(CommitmentStatus::Breached, true, 20_000);
+    tree.record_outcome(CommitmentStatus::Fulfilled, true, 30_000);
+    assert_eq!(tree.twar_score(30_000), 0);
+
+    // Jump 32 half-lives (~3.2 years = 20,480,000 ledgers): all weights floor to 0.
+    let multi_year_ledger = 30_000 + 32 * half_life;
+    assert_eq!(tree.query_total(multi_year_ledger), 0);
+    assert_eq!(
+        tree.query_range(0, (TWAR_LEAF_CAPACITY - 1) as u32, multi_year_ledger),
+        0
+    );
+    assert_eq!(tree.twar_score(multi_year_ledger), 50);
+
+    // Jump near u32::MAX ledgers (~680 years): no overflow or panic, baseline preserved.
+    assert_eq!(tree.query_total(u32::MAX), 0);
+    assert_eq!(tree.twar_score(u32::MAX), 50);
+
+    // A fresh fulfilled outcome after a multi-year dormant gap anchors cleanly.
+    tree.record_outcome(CommitmentStatus::Fulfilled, true, multi_year_ledger);
+    assert_eq!(tree.twar_score(multi_year_ledger), 60);
+}
+
+#[test]
+fn test_twar_counter_and_score_overflow_underflow_saturation() {
+    let mut tree = TWARSegmentTree::new();
+
+    // Positive score saturation at i64::MAX.
+    tree.update_point(0, i64::MAX, 1_000);
+    tree.update_point(0, i64::MAX, 1_000);
+    assert_eq!(tree.query_point(0, 1_000), i64::MAX);
+    assert_eq!(tree.query_total(1_000), i64::MAX);
+    assert_eq!(tree.twar_score(1_000), 100);
+
+    // Cross-node saturation when two adjacent leaves both hold i64::MAX.
+    tree.update_point(1, i64::MAX, 1_000);
+    assert_eq!(tree.query_range(0, 1, 1_000), i64::MAX);
+
+    // Negative score saturation at i64::MIN.
+    let mut neg_tree = TWARSegmentTree::new();
+    neg_tree.update_point(4, i64::MIN, 2_000);
+    neg_tree.update_point(4, -1_000_000, 2_000);
+    assert_eq!(neg_tree.query_point(4, 2_000), i64::MIN);
+    assert_eq!(neg_tree.query_total(2_000), i64::MIN);
+    assert_eq!(neg_tree.twar_score(2_000), 0);
+
+    // Retracting on an empty leaf saturates event_count at 0 without underflow.
+    let mut empty_tree = TWARSegmentTree::new();
+    empty_tree.retract_point(7, 500, 1_000);
+    assert_eq!(empty_tree.leaf_node(7).event_count, 0);
+    assert_eq!(empty_tree.total_updates(), 0);
+    assert_eq!(empty_tree.query_point(7, 1_000), -500);
+}
+
+#[test]
+fn test_twar_update_cpu_instruction_budget_under_150k() {
+    let (env, client, issuer, _counterparty) = setup();
+    let contract_id = client.address.clone();
+
+    // Seed initial packed tree in instance storage so the update measures a full
+    // load -> O(log N) path recomputation -> packed Bytes write cycle.
+    env.as_contract(&contract_id, || {
+        update_twar_point(&env, &issuer, 0, 10 * TWAR_OUTCOME_SCALE, 1_000);
+    });
+
+    env.cost_estimate().budget().reset_default();
+    let before_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+    env.as_contract(&contract_id, || {
+        update_twar_point(&env, &issuer, 17, 10 * TWAR_OUTCOME_SCALE, 12_000);
+    });
+
+    let after_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let update_cpu_cost = after_cpu.saturating_sub(before_cpu);
+
+    assert!(
+        update_cpu_cost < 150_000,
+        "TWARSegmentTree update used {update_cpu_cost} CPU instructions, exceeding 150,000 limit"
+    );
+}
