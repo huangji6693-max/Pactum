@@ -412,6 +412,10 @@ jobs:
         working-directory: packages/cli
         run: npm run build
 
+      - name: Run CLI E2E sandbox integration tests
+        working-directory: packages/cli
+        run: npm run test:e2e
+
   frontend-tests:
     name: Frontend Tests (Module Federation)
     runs-on: ubuntu-latest

@@ -78,19 +78,59 @@ export function createReputationCommand(): Command {
         }
 
         const network = options.network ?? creds.network ?? 'testnet';
+        const rpcUrl = options.rpcUrl || process.env.PACTUM_RPC_URL;
 
         try {
-          // 1. Fetch on-chain reputation data via @pactum/sdk
-          const client = new PactumClient({
-            network: network as any,
-            rpcUrl: options.rpcUrl,
-            contractId: options.contractId,
-          });
+          let fulfilled = 0;
+          let late = 0;
+          let breached = 0;
 
-          const reputation = await client.getReputation(address);
-          const fulfilled = Number(reputation.fulfilledCount);
-          const late = Number(reputation.lateCount);
-          const breached = Number(reputation.breachedCount);
+          try {
+            // 1. Fetch on-chain reputation data via @pactum/sdk
+            const client = new PactumClient({
+              network: network as any,
+              rpcUrl,
+              contractId: options.contractId,
+            });
+
+            const reputation = await client.getReputation(address);
+            fulfilled = Number(reputation.fulfilledCount);
+            late = Number(reputation.lateCount);
+            breached = Number(reputation.breachedCount);
+          } catch (sdkErr: any) {
+            if (!rpcUrl) {
+              throw sdkErr;
+            }
+            const simRes = await fetch(rpcUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'simulateTransaction',
+                params: {
+                  contractMethod: 'get_reputation',
+                  address,
+                  contractId: options.contractId,
+                },
+              }),
+            });
+            if (!simRes.ok) {
+              throw new Error(`RPC HTTP ${simRes.status} (${simRes.statusText})`);
+            }
+            const simJson = (await simRes.json()) as any;
+            if (simJson.error) {
+              throw new Error(simJson.error.message || JSON.stringify(simJson.error));
+            }
+            if (simJson.result?.error) {
+              throw new Error(`Soroban simulation error: ${simJson.result.error}`);
+            }
+            const rep = simJson.result?.reputation || simJson.result || {};
+            fulfilled = Number(rep.fulfilledCount ?? rep.fulfilled_count ?? rep.fulfilled ?? 0);
+            late = Number(rep.lateCount ?? rep.late_count ?? rep.late ?? 0);
+            breached = Number(rep.breachedCount ?? rep.breached_count ?? rep.breached ?? 0);
+          }
+
           const total = fulfilled + late + breached;
           const score = calculateTrustScore(fulfilled, late, breached);
 
@@ -128,53 +168,63 @@ export function createReputationCommand(): Command {
             `    ${chalk.gray('━ Total Volume:')}  ${chalk.bold(total)} historical commitments\n`,
           );
         } catch (error: any) {
-          // Fallback: Try backend API if Soroban RPC is unreachable / offline
-          try {
-            const apiBase = options.apiUrl || process.env.PACTUM_API_URL || 'http://localhost:3000';
-            const res = await fetch(`${apiBase}/reputation/${address}`);
-            if (res.ok) {
-              const data = (await res.json()) as any;
-              const fulfilled = Number(data.fulfilled ?? 0);
-              const late = Number(data.late ?? 0);
-              const breached = Number(data.breached ?? 0);
-              const total = fulfilled + late + breached;
-              const score = calculateTrustScore(fulfilled, late, breached);
+          const isContractError = String(error?.message || '').includes('Soroban simulation error');
+          // Fallback: Try backend API if Soroban RPC is unreachable / offline (unless contract reverted without explicit --api-url)
+          if (!isContractError || options.apiUrl) {
+            try {
+              const apiBase =
+                options.apiUrl || process.env.PACTUM_API_URL || 'http://localhost:3000';
+              const res = await fetch(`${apiBase}/reputation/${address}`);
+              if (res.ok) {
+                const data = (await res.json()) as any;
+                const fulfilled = Number(data.fulfilled ?? 0);
+                const late = Number(data.late ?? 0);
+                const breached = Number(data.breached ?? 0);
+                const total = fulfilled + late + breached;
+                const score = calculateTrustScore(fulfilled, late, breached);
 
-              if (options.json) {
+                if (options.json) {
+                  console.log(
+                    JSON.stringify(
+                      {
+                        address,
+                        network,
+                        score,
+                        reputation: { ...data, fulfilled, late, breached, total },
+                        source: 'backend-api',
+                      },
+                      null,
+                      2,
+                    ),
+                  );
+                  return;
+                }
+
                 console.log(
-                  JSON.stringify(
-                    {
-                      address,
-                      network,
-                      score,
-                      reputation: { ...data, fulfilled, late, breached, total },
-                      source: 'backend-api',
-                    },
-                    null,
-                    2,
-                  ),
+                  chalk.bold.cyan('\n  Pactum Trust Layer — Reputation Scorecard (API)\n'),
+                );
+                console.log(`  ${chalk.gray('Target Address:')}   ${chalk.bold.white(address)}`);
+                console.log(
+                  `  ${chalk.gray('Trust Score:')}      ${formatTrustScoreBadge(score)}\n`,
+                );
+                console.log(chalk.bold('  Fulfillment Breakdown:'));
+                console.log(
+                  `    ${chalk.green('✔ Fulfilled:')}    ${chalk.bold(fulfilled)} commitments`,
+                );
+                console.log(
+                  `    ${chalk.yellow('▲ Late:')}         ${chalk.bold(late)} commitments`,
+                );
+                console.log(
+                  `    ${chalk.red('✖ Breached:')}     ${chalk.bold(breached)} commitments`,
+                );
+                console.log(
+                  `    ${chalk.gray('━ Total Volume:')}  ${chalk.bold(total)} historical commitments\n`,
                 );
                 return;
               }
-
-              console.log(chalk.bold.cyan('\n  Pactum Trust Layer — Reputation Scorecard (API)\n'));
-              console.log(`  ${chalk.gray('Target Address:')}   ${chalk.bold.white(address)}`);
-              console.log(`  ${chalk.gray('Trust Score:')}      ${formatTrustScoreBadge(score)}\n`);
-              console.log(chalk.bold('  Fulfillment Breakdown:'));
-              console.log(
-                `    ${chalk.green('✔ Fulfilled:')}    ${chalk.bold(fulfilled)} commitments`,
-              );
-              console.log(`    ${chalk.yellow('▲ Late:')}         ${chalk.bold(late)} commitments`);
-              console.log(
-                `    ${chalk.red('✖ Breached:')}     ${chalk.bold(breached)} commitments`,
-              );
-              console.log(
-                `    ${chalk.gray('━ Total Volume:')}  ${chalk.bold(total)} historical commitments\n`,
-              );
-              return;
+            } catch {
+              // Ignore fallback error and report original error below
             }
-          } catch {
-            // Ignore fallback error and report original error below
           }
 
           const msg = error?.message || String(error);

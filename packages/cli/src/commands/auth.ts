@@ -54,7 +54,8 @@ export function createAuthCommand(): Command {
     .description(
       'Authenticate and store your Stellar secret key locally in a secure keychain/config',
     )
-    .argument('[secret_key]', 'Stellar secret key (starts with S, 56 characters)')
+    .argument('[secret_key]', 'Stellar secret key (starts with S, 56 characters) or "init"')
+    .argument('[init_secret_key]', 'Stellar secret key when invoking `pactum auth init <key>`')
     .option('-n, --network <network>', 'Default network to associate with credentials', 'testnet')
     .option(
       '--secret-stdin',
@@ -66,6 +67,7 @@ export function createAuthCommand(): Command {
     .action(
       async (
         secretKeyArg: string | undefined,
+        initSecretKeyArg: string | undefined,
         options: {
           network: string;
           secretStdin?: boolean;
@@ -74,6 +76,8 @@ export function createAuthCommand(): Command {
           json?: boolean;
         },
       ) => {
+        const isInitSubcommand = secretKeyArg?.trim().toLowerCase() === 'init';
+        const resolvedArg = isInitSubcommand ? initSecretKeyArg : secretKeyArg;
         // Option: Clear credentials
         if (options.clear) {
           const cleared = clearCredentials();
@@ -133,11 +137,13 @@ export function createAuthCommand(): Command {
         }
 
         // Resolve secret key from argument, stdin, or interactive hidden prompt
-        let secretKey = secretKeyArg?.trim();
+        let secretKey = resolvedArg?.trim();
         if (!secretKey && options.secretStdin) {
           secretKey = await readSecretFromStdin();
         } else if (!secretKey && process.stdin.isTTY && !options.json) {
           secretKey = await promptHiddenSecret();
+        } else if (!secretKey && isInitSubcommand && !process.stdin.isTTY) {
+          secretKey = await readSecretFromStdin();
         }
 
         if (!secretKey) {
