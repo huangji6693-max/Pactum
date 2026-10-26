@@ -1,10 +1,13 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 
+pub mod storage;
+
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, token,
     Address, Bytes, BytesN, Env, Symbol,
 };
+pub use storage::{DataKey, DynamicDisputeQuote, FeeEngineState};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -61,13 +64,6 @@ pub struct StateProof {
     pub balance_a: i128,
     pub balance_b: i128,
     pub state_hash: BytesN<32>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    NextChannelId,
-    Channel(u64),
 }
 
 #[contractclient(name = "WasmConsensusRulesetClient")]
@@ -230,6 +226,189 @@ impl StateChannelContract {
         );
     }
 
+    /// Configures the EIP-1559 style adaptive fee engine parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn configure_fee_engine(
+        env: Env,
+        base_dispute_bond: i128,
+        target_gas: u64,
+        max_elasticity_bps: u64,
+        decay_rate_bps: u64,
+        quiet_window_secs: u64,
+        variance_spike_multiplier_bps: u64,
+        rebate_share_bps: u64,
+    ) -> FeeEngineState {
+        if base_dispute_bond <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+        if target_gas == 0
+            || max_elasticity_bps == 0
+            || max_elasticity_bps > storage::BPS_DENOMINATOR
+            || decay_rate_bps > storage::BPS_DENOMINATOR
+            || quiet_window_secs == 0
+            || rebate_share_bps > storage::BPS_DENOMINATOR
+        {
+            panic_with_error!(&env, Error::InvalidConsensusRules);
+        }
+
+        let now = env.ledger().timestamp();
+        let state = FeeEngineState {
+            base_dispute_bond,
+            current_dispute_bond: base_dispute_bond,
+            target_gas,
+            moving_avg_gas: target_gas,
+            historical_gas_variance: (target_gas / 5).max(1),
+            variance_spike_multiplier_bps,
+            max_elasticity_bps,
+            decay_rate_bps,
+            quiet_window_secs,
+            consecutive_disputes: 0,
+            last_updated_at: now,
+            rebate_share_bps,
+        };
+        storage::save_fee_engine(&env, &state);
+        state
+    }
+
+    /// Returns the active fee engine state after applying any elapsed quiet-period decay.
+    pub fn get_fee_engine_state(env: Env) -> FeeEngineState {
+        let mut state = storage::load_fee_engine(&env);
+        storage::apply_quiet_decay(&mut state, env.ledger().timestamp());
+        state
+    }
+
+    /// Quotes the dynamic dispute bond, fee surcharge, and effective challenge window
+    /// for `channel_id` at `observed_gas` without mutating state.
+    pub fn quote_dispute_bond(env: Env, channel_id: u64, observed_gas: u64) -> DynamicDisputeQuote {
+        let channel: Channel = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Channel(channel_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ChannelNotFound));
+
+        let mut state = storage::load_fee_engine(&env);
+        storage::update_fee_engine_on_dispute(
+            &mut state,
+            env.ledger().timestamp(),
+            channel.dispute_window,
+            observed_gas,
+        )
+    }
+
+    /// Returns the accumulated protocol security reserve for `token`.
+    pub fn get_security_reserve(env: Env, token: Address) -> i128 {
+        storage::get_security_reserve(&env, &token)
+    }
+
+    /// Submits a state proof with EIP-1559 adaptive dispute bond scaling, dynamic
+    /// challenge window extension under fee spikes, and security reserve fee accrual.
+    pub fn dispute_channel_with_gas(
+        env: Env,
+        caller: Address,
+        channel_id: u64,
+        proof: StateProof,
+        observed_gas: u64,
+    ) -> DynamicDisputeQuote {
+        caller.require_auth();
+
+        let mut channel: Channel = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Channel(channel_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ChannelNotFound));
+
+        if channel.status == ChannelStatus::Closed {
+            panic_with_error!(&env, Error::ChannelAlreadyClosed);
+        }
+
+        if caller != channel.party_a && caller != channel.party_b {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        if proof.channel_id != channel_id {
+            panic_with_error!(&env, Error::InvalidStateProof);
+        }
+
+        if proof.nonce <= channel.latest_nonce {
+            panic_with_error!(&env, Error::InvalidNonce);
+        }
+
+        if proof.balance_a + proof.balance_b != channel.balance_a + channel.balance_b {
+            panic_with_error!(&env, Error::InvalidStateProof);
+        }
+
+        let now = env.ledger().timestamp();
+
+        if channel.status == ChannelStatus::Disputed
+            && now >= channel.dispute_started_at + channel.dispute_window
+        {
+            panic_with_error!(&env, Error::DisputeWindowExpired);
+        }
+
+        // If a prior disputer had a refundable bond escrowed on this channel, refund it
+        // before locking the new disputer's bond.
+        let prev_bond = storage::get_channel_dispute_bond(&env, channel_id);
+        if prev_bond > 0 {
+            if let Some(prev_disputer) = channel.disputer.clone() {
+                let token_client = token::Client::new(&env, &channel.token);
+                token_client.transfer(&env.current_contract_address(), &prev_disputer, &prev_bond);
+                storage::set_channel_dispute_bond(&env, channel_id, 0);
+            }
+        }
+
+        let mut fee_state = storage::load_fee_engine(&env);
+        let quote = storage::update_fee_engine_on_dispute(
+            &mut fee_state,
+            now,
+            channel.dispute_window,
+            observed_gas,
+        );
+        storage::save_fee_engine(&env, &fee_state);
+
+        if quote.total_bond > 0 {
+            let token_client = token::Client::new(&env, &channel.token);
+            token_client.transfer(&caller, &env.current_contract_address(), &quote.total_bond);
+        }
+
+        storage::set_channel_dispute_bond(&env, channel_id, quote.base_bond_component);
+        if quote.dynamic_fee_surcharge > 0 {
+            let current_reserve = storage::get_security_reserve(&env, &channel.token);
+            storage::set_security_reserve(
+                &env,
+                &channel.token,
+                current_reserve.saturating_add(quote.dynamic_fee_surcharge),
+            );
+        }
+
+        if quote.effective_dispute_window > channel.dispute_window {
+            channel.dispute_window = quote.effective_dispute_window;
+        }
+
+        channel.latest_nonce = proof.nonce;
+        channel.latest_balance_a = proof.balance_a;
+        channel.latest_balance_b = proof.balance_b;
+        channel.latest_state_hash = proof.state_hash;
+        channel.status = ChannelStatus::Disputed;
+        channel.dispute_started_at = now;
+        channel.disputer = Some(caller.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Channel(channel_id), &channel);
+
+        env.events().publish(
+            (Symbol::new(&env, "channel_disputed_dynamic"), channel_id),
+            (
+                caller,
+                proof.nonce,
+                quote.total_bond,
+                channel.dispute_window,
+            ),
+        );
+
+        quote
+    }
+
     /// Verifies off-chain state transitions against the custom WASM consensus ruleset.
     /// The challenge MUST verify the disputed state currently held in `channel.latest_*`.
     /// If `validate_transition` returns false, the disputer who submitted the invalid state proof is slashed,
@@ -282,15 +461,35 @@ impl StateChannelContract {
 
         let token_client = token::Client::new(&env, &channel.token);
         let total_collateral = channel.balance_a + channel.balance_b;
+        let escrowed_bond = storage::get_channel_dispute_bond(&env, channel_id);
 
         if !is_valid {
             // Slashing branch: disputer submitted an invalid state transition!
-            // Slashing offender (disputer) and awarding 100% collateral to challenger.
-            if total_collateral > 0 {
+            // Slashing offender (disputer) and awarding 100% collateral + escrowed dispute bond
+            // + proportional protocol security reserve rebate to the honest challenger.
+            storage::set_channel_dispute_bond(&env, channel_id, 0);
+
+            let reserve = storage::get_security_reserve(&env, &channel.token);
+            let fee_state = storage::load_fee_engine(&env);
+            let rebate = if reserve > 0 {
+                (reserve.saturating_mul(i128::from(fee_state.rebate_share_bps)))
+                    / i128::from(storage::BPS_DENOMINATOR)
+            } else {
+                0
+            };
+            if rebate > 0 {
+                storage::set_security_reserve(&env, &channel.token, reserve.saturating_sub(rebate));
+            }
+
+            let total_challenger_payout = total_collateral
+                .saturating_add(escrowed_bond)
+                .saturating_add(rebate);
+
+            if total_challenger_payout > 0 {
                 token_client.transfer(
                     &env.current_contract_address(),
                     &challenger,
-                    &total_collateral,
+                    &total_challenger_payout,
                 );
             }
 
@@ -312,10 +511,15 @@ impl StateChannelContract {
 
             env.events().publish(
                 (Symbol::new(&env, "offender_slashed"), channel_id),
-                (disputer, challenger, total_collateral),
+                (disputer, challenger, total_challenger_payout),
             );
         } else {
-            // Valid transition branch: state transition passed WASM consensus rules verification
+            // Valid transition branch: state transition passed WASM consensus rules verification.
+            // Refund any escrowed base dispute bond back to the honest disputer.
+            if escrowed_bond > 0 {
+                storage::set_channel_dispute_bond(&env, channel_id, 0);
+                token_client.transfer(&env.current_contract_address(), &disputer, &escrowed_bond);
+            }
             env.events().publish(
                 (Symbol::new(&env, "transition_verified"), channel_id),
                 (challenger, channel.latest_nonce),
@@ -371,6 +575,14 @@ impl StateChannelContract {
                 &channel.party_b,
                 &channel.latest_balance_b,
             );
+        }
+
+        let escrowed_bond = storage::get_channel_dispute_bond(&env, channel_id);
+        if escrowed_bond > 0 {
+            storage::set_channel_dispute_bond(&env, channel_id, 0);
+            if let Some(disputer) = channel.disputer.clone() {
+                token_client.transfer(&contract_address, &disputer, &escrowed_bond);
+            }
         }
 
         channel.status = ChannelStatus::Closed;
