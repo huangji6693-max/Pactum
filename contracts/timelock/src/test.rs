@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! Timelock tests, driven end to end against the real registry contract.
 //!
 //! The target is the actual `registry::RegistryContract` rather than a mock, so these
@@ -705,6 +704,333 @@ fn test_registry_state_is_untouched_by_a_rejected_early_execution() {
     assert_eq!(g.registry.get_upgrade_admin(), Some(g.timelock_id.clone()));
     assert_eq!(g.timelock.get_proposal(&id).state, ProposalState::Queued);
     assert_eq!(g.registry.get_arbitrator(), g.arbitrator);
+}
+
+// -------------------------------------------------------------------------
+// Guardian Multi-Sig Veto, Circuit Breaker & Post-Pause Unwinding (#311)
+// -------------------------------------------------------------------------
+
+#[contract]
+pub struct MockUpgradeTarget;
+
+#[contractimpl]
+impl MockUpgradeTarget {
+    pub fn upgrade(_env: Env, _wasm_hash: BytesN<32>, _schema_version: u32) {}
+    pub fn set_upgrade_admin(_env: Env, _new_admin: Address) {}
+}
+
+#[test]
+fn test_guardian_multisig_veto_and_purge_removes_malicious_proposal_prior_to_eta() {
+    let g = setup();
+    let g1 = g.guardian.clone();
+    let g2 = Address::generate(&g.env);
+    let g3 = Address::generate(&g.env);
+
+    g.timelock.configure_guardians(
+        &soroban_sdk::vec![&g.env, g1.clone(), g2.clone(), g3.clone()],
+        &2,
+    );
+    assert_eq!(g.timelock.get_guardian_threshold(), 2);
+    assert_eq!(g.timelock.get_guardians().len(), 3);
+
+    let malicious_id = g.timelock.queue(
+        &g.admin,
+        &g.registry_id,
+        &ProposalAction::Upgrade(hash(&g.env, 0xEE), 2),
+        &hash(&g.env, 0xFF),
+    );
+
+    // 1-of-3 guardian signature is rejected when threshold is 2.
+    let insufficient = g
+        .timelock
+        .try_veto_and_purge(&soroban_sdk::vec![&g.env, g1.clone()], &malicious_id)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        insufficient,
+        GovernanceError::InsufficientGuardianQuorum.into()
+    );
+
+    // Duplicate signer does not satisfy 2-of-3 quorum.
+    let duplicate = g
+        .timelock
+        .try_veto_and_purge(
+            &soroban_sdk::vec![&g.env, g1.clone(), g1.clone()],
+            &malicious_id,
+        )
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        duplicate,
+        GovernanceError::InsufficientGuardianQuorum.into()
+    );
+
+    // Non-member signer is rejected.
+    let stranger = Address::generate(&g.env);
+    let non_member = g
+        .timelock
+        .try_veto_and_purge(
+            &soroban_sdk::vec![&g.env, g1.clone(), stranger],
+            &malicious_id,
+        )
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        non_member,
+        GovernanceError::InsufficientGuardianQuorum.into()
+    );
+
+    // Valid 2-of-3 guardian quorum vetoes and purges the proposal prior to ETA.
+    g.timelock.veto_and_purge(
+        &soroban_sdk::vec![&g.env, g2.clone(), g3.clone()],
+        &malicious_id,
+    );
+    assert!(g.timelock.is_purged(&malicious_id));
+    assert!(!g.timelock.is_executable(&malicious_id));
+
+    let get_err = g
+        .timelock
+        .try_get_proposal(&malicious_id)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(get_err, GovernanceError::ProposalAlreadyPurged.into());
+
+    // Advancing past ETA still refuses execution of the purged proposal.
+    advance(&g.env, MIN_DELAY_SECONDS);
+    let exec_err = g
+        .timelock
+        .try_execute(&g.admin, &malicious_id)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(exec_err, GovernanceError::ProposalAlreadyPurged.into());
+}
+
+#[test]
+fn test_configure_guardians_rejects_invalid_thresholds_and_duplicates() {
+    let g = setup();
+    let g1 = g.guardian.clone();
+    let g2 = Address::generate(&g.env);
+
+    // Empty set rejected.
+    assert_eq!(
+        g.timelock
+            .try_configure_guardians(&soroban_sdk::vec![&g.env], &1)
+            .unwrap_err()
+            .unwrap(),
+        GovernanceError::InvalidGuardianSet.into()
+    );
+
+    // Threshold 0 rejected.
+    assert_eq!(
+        g.timelock
+            .try_configure_guardians(&soroban_sdk::vec![&g.env, g1.clone()], &0)
+            .unwrap_err()
+            .unwrap(),
+        GovernanceError::InvalidGuardianSet.into()
+    );
+
+    // Threshold > count rejected.
+    assert_eq!(
+        g.timelock
+            .try_configure_guardians(&soroban_sdk::vec![&g.env, g1.clone(), g2.clone()], &3)
+            .unwrap_err()
+            .unwrap(),
+        GovernanceError::InvalidGuardianSet.into()
+    );
+
+    // Duplicate guardian address rejected.
+    assert_eq!(
+        g.timelock
+            .try_configure_guardians(&soroban_sdk::vec![&g.env, g1.clone(), g1], &2)
+            .unwrap_err()
+            .unwrap(),
+        GovernanceError::InvalidGuardianSet.into()
+    );
+}
+
+#[test]
+fn test_circuit_breaker_restricts_upgrades_to_at_most_one_per_thirty_day_epoch() {
+    let g = setup();
+    let mock_target = g.env.register(MockUpgradeTarget, ());
+
+    let upgrade_1 = g.timelock.queue(
+        &g.admin,
+        &mock_target,
+        &ProposalAction::Upgrade(hash(&g.env, 0x01), 2),
+        &hash(&g.env, 0x10),
+    );
+    let upgrade_2 = g.timelock.queue(
+        &g.admin,
+        &mock_target,
+        &ProposalAction::Upgrade(hash(&g.env, 0x02), 2),
+        &hash(&g.env, 0x20),
+    );
+
+    // Advance 7 days to ETA: first upgrade executes and consumes the 30-day epoch quota.
+    advance(&g.env, MIN_DELAY_SECONDS);
+    assert!(g.timelock.is_executable(&upgrade_1));
+    g.timelock.execute(&g.admin, &upgrade_1);
+
+    let cb_state = g.timelock.get_circuit_breaker_state();
+    assert_eq!(cb_state.upgrades_in_epoch, 1);
+    assert_eq!(cb_state.max_upgrades_per_epoch, MAX_UPGRADES_PER_EPOCH);
+    assert_eq!(
+        cb_state.epoch_duration_seconds,
+        CIRCUIT_BREAKER_EPOCH_SECONDS
+    );
+
+    // Second upgrade within the same 30-day epoch is blocked by the circuit breaker.
+    assert!(!g.timelock.is_executable(&upgrade_2));
+    let tripped = g
+        .timelock
+        .try_execute(&g.admin, &upgrade_2)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(tripped, GovernanceError::CircuitBreakerTripped.into());
+
+    // Queue a third upgrade on day 25 of the epoch so its ETA lands after the 30-day window.
+    advance(&g.env, 25 * 86_400);
+    let upgrade_3 = g.timelock.queue(
+        &g.admin,
+        &mock_target,
+        &ProposalAction::Upgrade(hash(&g.env, 0x03), 2),
+        &hash(&g.env, 0x30),
+    );
+
+    // Advance 7 days (total 32 days since upgrade_1 execution): 30-day epoch has rolled over.
+    advance(&g.env, MIN_DELAY_SECONDS);
+    assert_eq!(g.timelock.get_circuit_breaker_state().upgrades_in_epoch, 0);
+    assert!(g.timelock.is_executable(&upgrade_3));
+    g.timelock.execute(&g.admin, &upgrade_3);
+    assert_eq!(
+        g.timelock.get_proposal(&upgrade_3).state,
+        ProposalState::Executed
+    );
+}
+
+#[test]
+fn test_emergency_pause_and_time_decayed_post_pause_recovery_prevents_deadlock() {
+    let g = setup();
+    let mock_target = g.env.register(MockUpgradeTarget, ());
+
+    // Queue a proposal before the emergency pause.
+    let prop_id = g.timelock.queue(
+        &g.admin,
+        &mock_target,
+        &ProposalAction::SetUpgradeAdmin(Address::generate(&g.env)),
+        &hash(&g.env, 0x44),
+    );
+
+    // Guardian triggers emergency pause without admin keys.
+    g.timelock
+        .emergency_pause(&soroban_sdk::vec![&g.env, g.guardian.clone()]);
+    let pause_state = g.timelock.get_pause_state();
+    assert!(pause_state.paused);
+    assert_eq!(pause_state.paused_at, START);
+    assert_eq!(
+        pause_state.unwind_starts_at,
+        START + MAX_PAUSE_DURATION_SECONDS
+    );
+    assert_eq!(
+        pause_state.recovery_ends_at,
+        START + MAX_PAUSE_DURATION_SECONDS + UNWIND_RECOVERY_WINDOW_SECONDS
+    );
+
+    // Queueing new proposals during active pause is blocked.
+    assert_eq!(
+        g.timelock
+            .try_queue(
+                &g.admin,
+                &mock_target,
+                &ProposalAction::SetUpgradeAdmin(Address::generate(&g.env)),
+                &hash(&g.env, 0x45),
+            )
+            .unwrap_err()
+            .unwrap(),
+        GovernanceError::ContractPaused.into()
+    );
+
+    // Advance past the 7-day proposal ETA while still inside the 14-day active pause window.
+    advance(&g.env, MIN_DELAY_SECONDS);
+    assert!(!g.timelock.is_executable(&prop_id));
+    assert_eq!(
+        g.timelock
+            .try_execute(&g.admin, &prop_id)
+            .unwrap_err()
+            .unwrap(),
+        GovernanceError::ContractPaused.into()
+    );
+
+    // Advance to the start of the post-pause unwinding window (day 14).
+    // Even if the guardian never unpauses, time-decayed recovery begins automatically.
+    advance(&g.env, MAX_PAUSE_DURATION_SECONDS - MIN_DELAY_SECONDS);
+    assert_eq!(
+        g.timelock.get_recovery_surcharge(),
+        UNWIND_RECOVERY_WINDOW_SECONDS
+    );
+
+    // At the exact start of unwinding (0s waited vs 7d remaining surcharge), execution is
+    // still held by the decaying recovery guard.
+    assert!(!g.timelock.is_executable(&prop_id));
+    assert_eq!(
+        g.timelock
+            .try_execute(&g.admin, &prop_id)
+            .unwrap_err()
+            .unwrap(),
+        GovernanceError::PostPauseDecayNotElapsed.into()
+    );
+
+    // Queueing a new proposal 2 days into the 7-day recovery window receives the linearly
+    // decayed surcharge (5 days remaining + 7 days base delay = 12 days).
+    advance(&g.env, 2 * 86_400);
+    let remaining_surcharge = g.timelock.get_recovery_surcharge();
+    assert_eq!(
+        remaining_surcharge,
+        UNWIND_RECOVERY_WINDOW_SECONDS - 2 * 86_400
+    );
+    let recovery_prop = g.timelock.queue(
+        &g.admin,
+        &mock_target,
+        &ProposalAction::SetUpgradeAdmin(Address::generate(&g.env)),
+        &hash(&g.env, 0x46),
+    );
+    let queued = g.timelock.get_proposal(&recovery_prop);
+    assert_eq!(
+        queued.eta,
+        queued.queued_at + MIN_DELAY_SECONDS + remaining_surcharge
+    );
+
+    // Advance another 1.5 days (total 3.5 days into the 7-day recovery window):
+    // time waited since unwind_starts_at (3.5d) >= remaining surcharge (3.5d),
+    // and proposal expiry was extended by the pause so `prop_id` executes cleanly.
+    advance(&g.env, 86_400 + 43_200);
+    assert!(g.timelock.is_executable(&prop_id));
+    g.timelock.execute(&g.admin, &prop_id);
+    assert_eq!(
+        g.timelock.get_proposal(&prop_id).state,
+        ProposalState::Executed
+    );
+
+    // Advance past the end of the recovery window: surcharge reaches 0.
+    advance(&g.env, 4 * 86_400);
+    assert_eq!(g.timelock.get_recovery_surcharge(), 0);
+}
+
+#[test]
+fn test_cooperative_unpause_clears_emergency_pause_immediately() {
+    let g = setup();
+    g.timelock
+        .emergency_pause(&soroban_sdk::vec![&g.env, g.guardian.clone()]);
+    assert!(g.timelock.get_pause_state().paused);
+
+    g.timelock.unpause();
+    assert!(!g.timelock.get_pause_state().paused);
+
+    // Calling unpause when not paused fails with ContractNotPaused.
+    assert_eq!(
+        g.timelock.try_unpause().unwrap_err().unwrap(),
+        GovernanceError::ContractNotPaused.into()
+    );
 }
 
 #[cfg(feature = "wasm-tests")]

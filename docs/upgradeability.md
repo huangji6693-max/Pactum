@@ -47,14 +47,15 @@ repository targets.
 ## Architecture
 
 ```
-        DAO (admin)                      guardian
+        DAO (admin)                guardian / multi-sig council
              │                               │
-   queue ────┤                               ├──── cancel (veto)
-   execute ──┤                               │
+   queue ────┤                               ├──── cancel / veto_and_purge
+   execute ──┤                               ├──── emergency_pause (14d + 7d decay)
              ▼                               ▼
       ┌──────────────────────────────────────────────┐
       │  TimelockContract                            │
       │    · MIN_DELAY = 7 days (a constant)         │
+      │    · MAX_UPGRADES_PER_EPOCH = 1 per 30 days  │
       │    · proposals pin the Wasm hash at queue    │
       │    · admin epoch invalidates stale proposals │
       └──────────────────────┬───────────────────────┘
@@ -319,6 +320,9 @@ at execution time. It carries the full proposal, including the pinned hash and t
 | **Re-initialization after upgrade**     | `initialize` and `init_upgrade_admin` are both single-shot and guarded. The bootstrap path for installing the upgrade admin closes permanently once used; every later change requires the timelock.                                     |
 | **Schema rollback**                     | `upgrade` rejects a schema version below the one in force, so an upgrade cannot silently reinterpret V2 rows as V1.                                                                                                                     |
 | **Unreviewed governance rotation**      | Moving the registry's upgrade authority is itself a timelocked proposal, subject to the same 7 days and the same veto.                                                                                                                  |
+| **Malicious queued proposal purge**     | A multi-sig guardian quorum (`configure_guardians`, `veto_and_purge`) can veto and purge a queued proposal prior to its ETA without administrative keys, deleting its payload from persistent storage and writing an immutable tombstone. |
+| **Rapid back-to-back upgrade drain**    | The circuit breaker rate limiter (`MAX_UPGRADES_PER_EPOCH = 1` per `CIRCUIT_BREAKER_EPOCH_SECONDS = 30 days`) caps contract upgrades and state migrations to at most 1 per 30-day epoch window (`GovernanceError::CircuitBreakerTripped`). |
+| **Zero-day dispatch & pause deadlock**  | `emergency_pause` lets the guardian multi-sig halt dispatch immediately without admin keys for `MAX_PAUSE_DURATION_SECONDS` (14 days), followed by an automatic `UNWIND_RECOVERY_WINDOW_SECONDS` (7-day) time-decayed recovery window so a lost or hostile guardian key cannot deadlock governance permanently. |
 
 ### Out of scope
 
