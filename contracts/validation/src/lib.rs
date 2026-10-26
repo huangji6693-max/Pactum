@@ -9,6 +9,9 @@ pub mod ast;
 #[cfg(any(feature = "std", feature = "wasm", test))]
 pub use ast::*;
 
+pub mod cuckoo;
+pub use cuckoo::*;
+
 /// The largest number of milestones a single commitment may be split into.
 pub const MAX_MILESTONES: u32 = 256;
 

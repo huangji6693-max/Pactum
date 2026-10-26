@@ -27,6 +27,12 @@ export function validate_commitment_params(
 
 export function verify_trace_hash(trace_json: string): boolean;
 
+export function cuckoo_filter_reset(): void;
+export function cuckoo_filter_len(): number;
+export function cuckoo_filter_contains(key_bytes: Uint8Array): boolean;
+export function cuckoo_filter_insert(key_bytes: Uint8Array): boolean;
+export function cuckoo_filter_delete(key_bytes: Uint8Array): boolean;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {

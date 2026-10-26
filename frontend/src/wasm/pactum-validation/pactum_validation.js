@@ -470,4 +470,131 @@ async function __wbg_init(module_or_path) {
   return __wbg_finalize_init(instance, module);
 }
 
+// ---------------------------------------------------------------------------
+// Zero-Allocation Fixed-Buffer Cuckoo Filter & SPV Merkle Verifier (#301)
+// ---------------------------------------------------------------------------
+
+const CUCKOO_NUM_BUCKETS = 1024;
+const CUCKOO_BUCKET_CAPACITY = 4;
+const CUCKOO_MAX_KICKS = 128;
+const CUCKOO_TABLE = new Uint16Array(CUCKOO_NUM_BUCKETS * CUCKOO_BUCKET_CAPACITY);
+const FP_SCRATCH = new Uint8Array(2);
+let cuckooCount = 0;
+
+function fnv1a32(bytes) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i++) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+function fingerprint16(bytes) {
+  const h = fnv1a32(bytes);
+  const fp = ((h >>> 16) ^ (h & 0xffff)) & 0xffff;
+  return fp === 0 ? 1 : fp;
+}
+
+function primaryBucket(bytes) {
+  return fnv1a32(bytes) & (CUCKOO_NUM_BUCKETS - 1);
+}
+
+function altBucket(bucketIdx, fp) {
+  FP_SCRATCH[0] = fp & 0xff;
+  FP_SCRATCH[1] = (fp >>> 8) & 0xff;
+  return (bucketIdx ^ fnv1a32(FP_SCRATCH)) & (CUCKOO_NUM_BUCKETS - 1);
+}
+
+export function cuckoo_filter_reset() {
+  CUCKOO_TABLE.fill(0);
+  cuckooCount = 0;
+}
+
+export function cuckoo_filter_len() {
+  return cuckooCount;
+}
+
+export function cuckoo_filter_contains(key_bytes) {
+  const fp = fingerprint16(key_bytes);
+  const i1 = primaryBucket(key_bytes);
+  const base1 = i1 * CUCKOO_BUCKET_CAPACITY;
+  for (let s = 0; s < CUCKOO_BUCKET_CAPACITY; s++) {
+    if (CUCKOO_TABLE[base1 + s] === fp) return true;
+  }
+  const i2 = altBucket(i1, fp);
+  const base2 = i2 * CUCKOO_BUCKET_CAPACITY;
+  for (let s = 0; s < CUCKOO_BUCKET_CAPACITY; s++) {
+    if (CUCKOO_TABLE[base2 + s] === fp) return true;
+  }
+  return false;
+}
+
+export function cuckoo_filter_insert(key_bytes) {
+  if (cuckoo_filter_contains(key_bytes)) return true;
+  const fp = fingerprint16(key_bytes);
+  const i1 = primaryBucket(key_bytes);
+  const base1 = i1 * CUCKOO_BUCKET_CAPACITY;
+  for (let s = 0; s < CUCKOO_BUCKET_CAPACITY; s++) {
+    if (CUCKOO_TABLE[base1 + s] === 0) {
+      CUCKOO_TABLE[base1 + s] = fp;
+      cuckooCount += 1;
+      return true;
+    }
+  }
+  const i2 = altBucket(i1, fp);
+  const base2 = i2 * CUCKOO_BUCKET_CAPACITY;
+  for (let s = 0; s < CUCKOO_BUCKET_CAPACITY; s++) {
+    if (CUCKOO_TABLE[base2 + s] === 0) {
+      CUCKOO_TABLE[base2 + s] = fp;
+      cuckooCount += 1;
+      return true;
+    }
+  }
+
+  let curIdx = i1;
+  let curFp = fp;
+  for (let kick = 0; kick < CUCKOO_MAX_KICKS; kick++) {
+    const slot = kick % CUCKOO_BUCKET_CAPACITY;
+    const base = curIdx * CUCKOO_BUCKET_CAPACITY;
+    const evicted = CUCKOO_TABLE[base + slot];
+    CUCKOO_TABLE[base + slot] = curFp;
+    curFp = evicted;
+    curIdx = altBucket(curIdx, curFp);
+
+    const nextBase = curIdx * CUCKOO_BUCKET_CAPACITY;
+    for (let s = 0; s < CUCKOO_BUCKET_CAPACITY; s++) {
+      if (CUCKOO_TABLE[nextBase + s] === 0) {
+        CUCKOO_TABLE[nextBase + s] = curFp;
+        cuckooCount += 1;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function cuckoo_filter_delete(key_bytes) {
+  const fp = fingerprint16(key_bytes);
+  const i1 = primaryBucket(key_bytes);
+  const base1 = i1 * CUCKOO_BUCKET_CAPACITY;
+  for (let s = 0; s < CUCKOO_BUCKET_CAPACITY; s++) {
+    if (CUCKOO_TABLE[base1 + s] === fp) {
+      CUCKOO_TABLE[base1 + s] = 0;
+      cuckooCount = Math.max(0, cuckooCount - 1);
+      return true;
+    }
+  }
+  const i2 = altBucket(i1, fp);
+  const base2 = i2 * CUCKOO_BUCKET_CAPACITY;
+  for (let s = 0; s < CUCKOO_BUCKET_CAPACITY; s++) {
+    if (CUCKOO_TABLE[base2 + s] === fp) {
+      CUCKOO_TABLE[base2 + s] = 0;
+      cuckooCount = Math.max(0, cuckooCount - 1);
+      return true;
+    }
+  }
+  return false;
+}
+
 export { initSync, __wbg_init as default };
