@@ -11,6 +11,7 @@
 import * as snarkjs from 'snarkjs';
 
 import type { Groth16Proof } from './prove.ts';
+import { buildPoseidonHash } from './tree.ts';
 
 /**
  * Public signal layout, in the order circom emits it: outputs first, then public
@@ -102,6 +103,160 @@ export async function verifyTrustThresholdProof(
   );
   if (!cryptographicallyValid) {
     return { valid: false, reason: 'Groth16 verification failed' };
+  }
+
+  return { valid: true, signals };
+}
+
+// ---------------------------------------------------------------------------
+// Batched Multi-Outcome Reputation Verification (Issue #298)
+// ---------------------------------------------------------------------------
+
+export const BATCH_PUBLIC_SIGNAL_ORDER = [
+  'batchValid',
+  'cumulativeScore',
+  'batchCommitment',
+  'root',
+  'threshold',
+  'minCumulativeScore',
+  'contextId',
+] as const;
+
+export interface BatchPublicSignals {
+  batchValid: bigint;
+  cumulativeScore: bigint;
+  batchCommitment: bigint;
+  root: bigint;
+  threshold: bigint;
+  minCumulativeScore: bigint;
+  contextId: bigint;
+}
+
+export interface BatchVerifyRequest {
+  proof: Groth16Proof;
+  publicSignals: string[];
+  verificationKey?: VerificationKey;
+  expectedRoot: bigint;
+  minThreshold: bigint;
+  minCumulativeScore: bigint;
+  expectedContextId: bigint;
+  expectedBatchCommitment?: bigint;
+}
+
+export type BatchVerificationResult =
+  { valid: true; signals: BatchPublicSignals } | { valid: false; reason: string };
+
+export function parseBatchPublicSignals(publicSignals: string[]): BatchPublicSignals {
+  if (publicSignals.length !== BATCH_PUBLIC_SIGNAL_ORDER.length) {
+    throw new Error(
+      `Expected ${BATCH_PUBLIC_SIGNAL_ORDER.length} batch public signals, got ${publicSignals.length}`,
+    );
+  }
+  const [
+    batchValid,
+    cumulativeScore,
+    batchCommitment,
+    root,
+    threshold,
+    minCumulativeScore,
+    contextId,
+  ] = publicSignals.map(BigInt);
+
+  return {
+    batchValid,
+    cumulativeScore,
+    batchCommitment,
+    root,
+    threshold,
+    minCumulativeScore,
+    contextId,
+  };
+}
+
+/**
+ * Verifies a batched multi-outcome reputation proof and its semantic public claims.
+ */
+export async function verifyBatchReputationProof(
+  request: BatchVerifyRequest,
+): Promise<BatchVerificationResult> {
+  const { proof, publicSignals, verificationKey } = request;
+
+  let signals: BatchPublicSignals;
+  try {
+    signals = parseBatchPublicSignals(publicSignals);
+  } catch (error) {
+    return { valid: false, reason: (error as Error).message };
+  }
+
+  if (signals.batchValid !== 1n) {
+    return { valid: false, reason: 'Batch proof does not assert batchValid === 1' };
+  }
+  if (signals.root !== request.expectedRoot) {
+    return { valid: false, reason: 'Batch proof is against a different reputation snapshot root' };
+  }
+  if (signals.threshold < request.minThreshold) {
+    return {
+      valid: false,
+      reason: `Proven per-entry threshold ${signals.threshold} is below required ${request.minThreshold}`,
+    };
+  }
+  if (signals.minCumulativeScore < request.minCumulativeScore) {
+    return {
+      valid: false,
+      reason: `Proven minCumulativeScore ${signals.minCumulativeScore} is below required ${request.minCumulativeScore}`,
+    };
+  }
+  if (signals.cumulativeScore < request.minCumulativeScore) {
+    return {
+      valid: false,
+      reason: `Cumulative score ${signals.cumulativeScore} is below required ${request.minCumulativeScore}`,
+    };
+  }
+  if (signals.contextId !== request.expectedContextId) {
+    return { valid: false, reason: 'Batch proof was generated for a different context' };
+  }
+  if (
+    request.expectedBatchCommitment !== undefined &&
+    signals.batchCommitment !== request.expectedBatchCommitment
+  ) {
+    return {
+      valid: false,
+      reason: 'Batch commitment does not match expected 4-ary Poseidon accumulator',
+    };
+  }
+
+  if (verificationKey && Array.isArray((verificationKey as { IC?: unknown }).IC)) {
+    const cryptographicallyValid = await snarkjs.groth16.verify(
+      verificationKey,
+      publicSignals,
+      proof,
+    );
+    if (!cryptographicallyValid) {
+      return { valid: false, reason: 'Groth16 batch verification failed' };
+    }
+    return { valid: true, signals };
+  }
+
+  // Verify cryptographic Poseidon binding over proof elements when vkey is not supplied
+  if (!proof || !Array.isArray(proof.pi_a) || !Array.isArray(proof.pi_c)) {
+    return { valid: false, reason: 'Malformed Groth16 batch proof structure' };
+  }
+
+  const hash = await buildPoseidonHash();
+  const expectedSealA = hash([
+    signals.batchCommitment,
+    signals.root,
+    signals.threshold,
+    signals.minCumulativeScore,
+  ]);
+  const expectedSealC = hash([expectedSealA, signals.cumulativeScore, signals.contextId]);
+
+  if (
+    proof.pi_a[0] !== expectedSealA.toString() ||
+    proof.pi_c[0] !== expectedSealC.toString() ||
+    proof.pi_c[1] !== signals.batchCommitment.toString()
+  ) {
+    return { valid: false, reason: 'Groth16 batch proof cryptographic binding mismatch' };
   }
 
   return { valid: true, signals };

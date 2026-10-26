@@ -3,9 +3,12 @@
 
 extern crate alloc;
 
-use crate::types::{CommitmentData, DataKey, MerkleProof, SequencerRecord};
-use crate::verifier::verify_merkle_fraud;
-use soroban_sdk::{contract, contractimpl, log, Address, BytesN, Env};
+use crate::types::{
+    BatchReputationClaim, BatchReputationEntry, CommitmentData, DataKey, MerkleProof,
+    SequencerRecord,
+};
+use crate::verifier::{verify_batch_reputation, verify_merkle_fraud};
+use soroban_sdk::{contract, contractimpl, log, Address, BytesN, Env, Vec};
 
 #[cfg(test)]
 mod tests;
@@ -164,5 +167,64 @@ impl FraudVerifierContract {
     pub fn get_stake(env: Env) -> i128 {
         let record: Option<SequencerRecord> = env.storage().instance().get(&DataKey::Sequencer);
         record.map(|r| r.stake).unwrap_or(0)
+    }
+
+    /// Registers an authoritative reputation snapshot root for a given epoch (#298).
+    pub fn register_reputation_root(
+        env: Env,
+        sequencer: Address,
+        epoch: u32,
+        snapshot_root: BytesN<32>,
+    ) {
+        sequencer.require_auth();
+        let record: Option<SequencerRecord> = env.storage().instance().get(&DataKey::Sequencer);
+        assert!(
+            record.is_some() && record.as_ref().unwrap().address == sequencer,
+            "Not the registered sequencer"
+        );
+        assert!(!record.unwrap().slashed, "Sequencer is slashed");
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReputationRoot(epoch), &snapshot_root);
+    }
+
+    /// Verifies a batched multi-outcome reputation proof (`k = 8` outcomes) against the
+    /// registered snapshot root and 4-ary Poseidon accumulator commitment (#298).
+    pub fn verify_batch_reputation_proof(
+        env: Env,
+        epoch: u32,
+        entries: Vec<BatchReputationEntry>,
+        claim: BatchReputationClaim,
+    ) -> bool {
+        let registered_root: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReputationRoot(epoch))
+            .expect("Reputation snapshot epoch not registered");
+
+        let replay_key = DataKey::VerifiedBatchContext(
+            claim.context_id,
+            claim.claimed_batch_commitment.clone(),
+        );
+        assert!(
+            !env.storage().persistent().has(&replay_key),
+            "Batch reputation proof already consumed for context"
+        );
+
+        let valid = verify_batch_reputation(&env, &registered_root, &entries, &claim);
+        if valid {
+            env.storage().persistent().set(&replay_key, &true);
+            env.events().publish(
+                (crate::types::BATCH_REP_TOPIC,),
+                (
+                    epoch,
+                    claim.context_id,
+                    claim.claimed_cumulative_score,
+                    claim.claimed_batch_commitment,
+                ),
+            );
+        }
+        valid
     }
 }

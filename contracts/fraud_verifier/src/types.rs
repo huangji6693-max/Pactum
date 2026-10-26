@@ -32,12 +32,37 @@ pub struct SequencerRecord {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct BatchReputationEntry {
+    pub addr_hi: BytesN<32>,
+    pub addr_lo: BytesN<32>,
+    pub score: u32,
+    pub siblings: Vec<BytesN<32>>,
+    pub path_bits: Vec<u32>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchReputationClaim {
+    pub snapshot_root: BytesN<32>,
+    pub min_threshold: u32,
+    pub min_cumulative_score: u64,
+    pub claimed_cumulative_score: u64,
+    pub claimed_batch_commitment: BytesN<32>,
+    pub context_id: u64,
+}
+
+#[contracttype]
 pub enum DataKey {
     Sequencer,
     Batch(u32),          // ledger_seq -> claimed_batch_root: BytesN<32>
     Challenge(u32, u32), // (ledger_seq, leaf_pos) -> bool (deduplication)
     FraudFlag(u32),      // ledger_seq -> bool (readable by #182 rollup engine)
+    ReputationRoot(u32), // snapshot_epoch -> snapshot_root: BytesN<32>
+    VerifiedBatchContext(u64, BytesN<32>), // (context_id, batch_commitment) -> bool
 }
 
 pub const BATCH_DEPTH: u32 = 10;
+pub const REPUTATION_BATCH_SIZE: u32 = 8;
 pub const FRAUD_PROVEN_TOPIC: soroban_sdk::Symbol = soroban_sdk::symbol_short!("Slashing");
+pub const BATCH_REP_TOPIC: soroban_sdk::Symbol = soroban_sdk::symbol_short!("BatchRep");

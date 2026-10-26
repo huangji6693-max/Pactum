@@ -8,7 +8,11 @@ use soroban_sdk::{
     Address, BytesN, Env, Vec,
 };
 
-use crate::types::{CommitmentData, MerkleProof, BATCH_DEPTH};
+use crate::types::{
+    BatchReputationClaim, BatchReputationEntry, CommitmentData, MerkleProof, BATCH_DEPTH,
+    REPUTATION_BATCH_SIZE,
+};
+use crate::verifier::{poseidon4_accumulator, recompute_variable_root, reputation_leaf};
 use crate::{FraudVerifierContract, FraudVerifierContractClient};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -264,4 +268,63 @@ fn test_is_batch_fraudulent_readable_after_slash() {
 
     // After fraud proof accepted, #182 rollup engine can read this
     assert!(client.is_batch_fraudulent(&500u32));
+}
+
+// ─── test 8: batch reputation proof verification (#298) ────────────────────
+
+#[test]
+fn test_verify_batch_reputation_proof_succeeds_and_rejects_tampering() {
+    let (env, client) = setup_env();
+    let seq = register_sequencer(&env, &client, 2_000_000_000i128);
+
+    // Build an 8-leaf reputation snapshot (depth 3 binary tree: 2^3 = 8 leaves)
+    let addr_hi = bytes32(&env, 0x10);
+    let addr_lo = bytes32(&env, 0x20);
+    let score = 900u32;
+
+    // For simplicity in constructing a valid shared root across all 8 entries,
+    // use a depth-0 (single-node) or depth-2 symmetric path where all 8 entries
+    // authenticate against `snapshot_root` with identical sibling hashes.
+    let mut siblings = Vec::new(&env);
+    let mut path_bits = Vec::new(&env);
+    siblings.push_back(bytes32(&env, 0x01));
+    siblings.push_back(bytes32(&env, 0x02));
+    path_bits.push_back(0u32);
+    path_bits.push_back(1u32);
+
+    let leaf = reputation_leaf(&env, &addr_hi, &addr_lo, score);
+    let snapshot_root = recompute_variable_root(&env, leaf.clone(), &siblings, &path_bits);
+
+    client.register_reputation_root(&seq, &1u32, &snapshot_root);
+
+    let mut entries = Vec::new(&env);
+    let mut leaves = Vec::new(&env);
+    for _ in 0..REPUTATION_BATCH_SIZE {
+        entries.push_back(BatchReputationEntry {
+            addr_hi: addr_hi.clone(),
+            addr_lo: addr_lo.clone(),
+            score,
+            siblings: siblings.clone(),
+            path_bits: path_bits.clone(),
+        });
+        leaves.push_back(leaf.clone());
+    }
+
+    let batch_commitment = poseidon4_accumulator(&env, &leaves);
+    let claim = BatchReputationClaim {
+        snapshot_root: snapshot_root.clone(),
+        min_threshold: 800u32,
+        min_cumulative_score: 7000u64,
+        claimed_cumulative_score: (score as u64) * 8,
+        claimed_batch_commitment: batch_commitment.clone(),
+        context_id: 42u64,
+    };
+
+    assert!(client.verify_batch_reputation_proof(&1u32, &entries, &claim));
+
+    // Tampered score or batch commitment must return false on a fresh context_id
+    let mut bad_claim = claim.clone();
+    bad_claim.context_id = 43u64;
+    bad_claim.claimed_cumulative_score += 10;
+    assert!(!client.verify_batch_reputation_proof(&1u32, &entries, &bad_claim));
 }

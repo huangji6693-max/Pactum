@@ -3,7 +3,10 @@ use ark_ff::{BigInteger, PrimeField};
 use light_poseidon_nostd::{Poseidon, PoseidonHasher};
 use soroban_sdk::{BytesN, Env, Vec};
 
-use crate::types::{CommitmentData, DataKey, MerkleProof, BATCH_DEPTH};
+use crate::types::{
+    BatchReputationClaim, BatchReputationEntry, CommitmentData, DataKey, MerkleProof, BATCH_DEPTH,
+    REPUTATION_BATCH_SIZE,
+};
 
 /// Helper to convert a byte slice into an `Fr` element.
 /// In Circom, values are often BigInts. For our hashing, we take the bytes,
@@ -115,4 +118,127 @@ pub fn verify_merkle_fraud(
     let recomputed = recompute_root(env, leaf, &proof.siblings, &proof.path_bits);
 
     recomputed != registered_root
+}
+
+/// Computes `Poseidon(3)(addr_hi, addr_lo, score)` matching `batch_reputation.circom`.
+pub fn reputation_leaf(
+    env: &Env,
+    addr_hi: &BytesN<32>,
+    addr_lo: &BytesN<32>,
+    score: u32,
+) -> BytesN<32> {
+    let mut poseidon = Poseidon::<Fr>::new_circom(3).unwrap();
+    let inputs = alloc::vec![
+        bytes_to_fr(&addr_hi.to_array()),
+        bytes_to_fr(&addr_lo.to_array()),
+        Fr::from(score as u64),
+    ];
+    let hash = poseidon.hash(&inputs).unwrap();
+    fr_to_bytes32(env, hash)
+}
+
+/// Recomputes a Poseidon binary Merkle root over an arbitrary-depth authentication path.
+pub fn recompute_variable_root(
+    env: &Env,
+    leaf: BytesN<32>,
+    siblings: &Vec<BytesN<32>>,
+    path_bits: &Vec<u32>,
+) -> BytesN<32> {
+    assert_eq!(
+        siblings.len(),
+        path_bits.len(),
+        "siblings and path_bits must have identical length"
+    );
+    let depth = siblings.len();
+    let mut current = leaf;
+    for i in 0..depth {
+        let sibling = siblings.get(i).unwrap();
+        let bit = path_bits.get(i).unwrap();
+        assert!(bit == 0 || bit == 1, "path_bit must be 0 or 1");
+        current = if bit == 0 {
+            hash2(env, &current, &sibling)
+        } else {
+            hash2(env, &sibling, &current)
+        };
+    }
+    current
+}
+
+/// Computes the 4-ary Poseidon tree accumulator over `k = 8` reputation leaf commitments:
+///   branch0 = Poseidon(4)(leaves[0..4])
+///   branch1 = Poseidon(4)(leaves[4..8])
+///   out     = Poseidon(2)(branch0, branch1)
+pub fn poseidon4_accumulator(env: &Env, leaves: &Vec<BytesN<32>>) -> BytesN<32> {
+    assert_eq!(
+        leaves.len(),
+        REPUTATION_BATCH_SIZE,
+        "poseidon4_accumulator requires exactly 8 leaves"
+    );
+    let mut p4_left = Poseidon::<Fr>::new_circom(4).unwrap();
+    let left_inputs = alloc::vec![
+        bytes_to_fr(&leaves.get(0).unwrap().to_array()),
+        bytes_to_fr(&leaves.get(1).unwrap().to_array()),
+        bytes_to_fr(&leaves.get(2).unwrap().to_array()),
+        bytes_to_fr(&leaves.get(3).unwrap().to_array()),
+    ];
+    let branch0 = fr_to_bytes32(env, p4_left.hash(&left_inputs).unwrap());
+
+    let mut p4_right = Poseidon::<Fr>::new_circom(4).unwrap();
+    let right_inputs = alloc::vec![
+        bytes_to_fr(&leaves.get(4).unwrap().to_array()),
+        bytes_to_fr(&leaves.get(5).unwrap().to_array()),
+        bytes_to_fr(&leaves.get(6).unwrap().to_array()),
+        bytes_to_fr(&leaves.get(7).unwrap().to_array()),
+    ];
+    let branch1 = fr_to_bytes32(env, p4_right.hash(&right_inputs).unwrap());
+
+    hash2(env, &branch0, &branch1)
+}
+
+/// Verifies a batched multi-outcome reputation claim (`k = 8` entries) against an
+/// authoritative snapshot root and 4-ary Poseidon accumulator commitment (#298).
+pub fn verify_batch_reputation(
+    env: &Env,
+    registered_root: &BytesN<32>,
+    entries: &Vec<BatchReputationEntry>,
+    claim: &BatchReputationClaim,
+) -> bool {
+    if entries.len() != REPUTATION_BATCH_SIZE {
+        return false;
+    }
+    if &claim.snapshot_root != registered_root {
+        return false;
+    }
+    if claim.claimed_cumulative_score < claim.min_cumulative_score {
+        return false;
+    }
+
+    let mut leaves = Vec::new(env);
+    let mut cumulative_score: u64 = 0;
+
+    for i in 0..REPUTATION_BATCH_SIZE {
+        let entry = entries.get(i).unwrap();
+        if entry.score <= claim.min_threshold {
+            return false;
+        }
+        if entry.siblings.len() != entry.path_bits.len() {
+            return false;
+        }
+
+        let leaf = reputation_leaf(env, &entry.addr_hi, &entry.addr_lo, entry.score);
+        let root = recompute_variable_root(env, leaf.clone(), &entry.siblings, &entry.path_bits);
+        if &root != registered_root {
+            return false;
+        }
+
+        leaves.push_back(leaf);
+        cumulative_score = cumulative_score.saturating_add(entry.score as u64);
+    }
+
+    if cumulative_score != claim.claimed_cumulative_score {
+        return false;
+    }
+
+    let computed_accumulator = poseidon4_accumulator(env, &leaves);
+    computed_accumulator == claim.claimed_batch_commitment
 }
