@@ -43,6 +43,7 @@ export default defineConfig(({ mode }) => {
           react: { singleton: true, requiredVersion: '^19.2.8' },
           'react-dom': { singleton: true, requiredVersion: '^19.2.8' },
           '@tanstack/react-query': { singleton: true, requiredVersion: '^5.101.4' },
+          '@pactum/soroban-client': { singleton: true, requiredVersion: '^0.1.0' },
         },
       }),
     ],

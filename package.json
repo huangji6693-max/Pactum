@@ -8,6 +8,7 @@
     "frontend",
     "sdk/js",
     "packages/cli",
+    "packages/soroban-client",
     "evm",
     "zk"
   ],

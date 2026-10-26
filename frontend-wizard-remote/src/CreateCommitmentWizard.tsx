@@ -21,10 +21,11 @@ import {
   preflightSimulate,
   fetchArbitrator,
   extractDiagnosticEventBlobs,
+  hexToBytes,
   type CreateCommitmentResult,
   type SimulationPreview,
   SorobanSimulationError,
-} from './lib/soroban';
+} from '@pactum/soroban-client';
 import { decodeSimulationError } from './lib/xdrDecode';
 import { postEncryptedTerms, createCommitment } from './lib/api';
 import UserProfile from './components/UserProfile';
@@ -381,7 +382,6 @@ export default function CreateCommitmentWizard({
         const contract = new Contract(contractId);
         const networkPassphrase =
           import.meta.env.VITE_STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET;
-        const { hexToBytes } = await import('./lib/soroban');
         const termsHashBytes = hexToBytes(termsHashHex);
         // Mirror submitCreateCommitment's own argument list exactly (see soroban.ts) --
         // create_commitment takes 9 parameters, and a preflight built with only the first

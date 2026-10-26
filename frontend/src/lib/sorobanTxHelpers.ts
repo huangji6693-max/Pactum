@@ -9,7 +9,7 @@ import {
   DEFAULT_NETWORK_PASSPHRASE,
   DEFAULT_CONTRACT_ID,
   getOrCreatePool,
-} from './soroban';
+} from '@pactum/soroban-client';
 import { decodeSimulationError } from './xdrDecode';
 
 const BASE_FEE = '100000';

@@ -1,0 +1,44 @@
+{
+  "name": "@pactum/soroban-client",
+  "version": "0.1.0",
+  "description": "Shared Soroban RPC pool, transaction builder, wallet adapters, error decoding, and preflight simulation client for Pactum",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@albedo-link/intent": "^0.13.0",
+    "@ledgerhq/hw-app-str": "^7.7.7",
+    "@ledgerhq/hw-transport-web-ble": "^6.35.0",
+    "@ledgerhq/hw-transport-webusb": "^6.35.0",
+    "@stellar/freighter-api": "^6.0.1",
+    "@stellar/stellar-sdk": "^16.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.10",
+    "tsup": "^8.5.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

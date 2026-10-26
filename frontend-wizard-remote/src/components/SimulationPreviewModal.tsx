@@ -1,5 +1,5 @@
 import { Loader2, X, AlertTriangle, CheckCircle2 } from 'lucide-react';
-import type { SimulationPreview } from '../lib/soroban';
+import type { SimulationPreview } from '@pactum/soroban-client';
 
 interface SimulationPreviewModalProps {
   preview: SimulationPreview | null;

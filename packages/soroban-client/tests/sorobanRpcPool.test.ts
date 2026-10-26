@@ -6,10 +6,8 @@ import {
   SorobanRpcPool,
   isRetryableError,
   type SorobanRpcNodeStats,
-} from './sorobanRpcPool';
-import { resolveSorobanRpcUrls, getOrCreatePool } from './soroban';
-
-// ── Fake rpc.Server helpers ──────────────────────────────────────────────
+} from '../src/sorobanRpcPool';
+import { resolveSorobanRpcUrls, getOrCreatePool } from '../src/soroban';
 
 interface FakeServer {
   calls: number;
@@ -74,8 +72,6 @@ function makePool(
   });
 }
 
-// ── isRetryableError classification ──────────────────────────────────────
-
 describe('isRetryableError', () => {
   it('treats HTTP 429 as retryable', () => {
     expect(isRetryableError(httpError(429))).toBe(true);
@@ -124,8 +120,6 @@ describe('isRetryableError', () => {
     expect(isRetryableError(new RetryableRpcError('overloaded'))).toBe(true);
   });
 });
-
-// ── Pool rotation & fallback ─────────────────────────────────────────────
 
 describe('SorobanRpcPool', () => {
   let callOrder: string[];
@@ -205,7 +199,6 @@ describe('SorobanRpcPool', () => {
     };
     const pool = makePool(fakes);
     await expect(pool.getHealth()).rejects.toThrow('simulation failed');
-    // Node b must never have been contacted.
     expect(callOrder).toEqual(['a']);
     expect(fakes.b.calls).toBe(0);
   });
@@ -285,13 +278,11 @@ describe('SorobanRpcPool', () => {
     };
     const pool = makePool(fakes, { cooldownMs: 30_000 });
 
-    // First call: a fails (429), b succeeds → a is penalised and put in cooldown.
     await pool.getHealth();
     expect(pool.preferredUrl).toBe('b');
     const aStatsAfterFirst = pool.getStats().find((s) => s.url === 'a')!;
     expect(aStatsAfterFirst.cooldownUntil).toBeGreaterThan(Date.now());
 
-    // Second call: a is cooling down, so b must be attempted first.
     await pool.getHealth();
     const attempts = callOrder.slice(2);
     expect(attempts[0]).toBe('b');
@@ -311,20 +302,17 @@ describe('SorobanRpcPool', () => {
     };
     const pool = makePool(fakes, { cooldownMs: 0 });
 
-    // 1) a fails → penalised; b answers and becomes the preferred node.
     await pool.getHealth();
     let aStats = pool.getStats().find((s) => s.url === 'a')!;
-    expect(aStats.score).toBe(75); // 100 - failurePenalty
+    expect(aStats.score).toBe(75);
     expect(pool.preferredUrl).toBe('b');
 
-    // 2) b goes down → traffic shifts to a, which has recovered, and its
-    //    health score climbs back up on success.
     aFails = false;
     bFails = true;
     await pool.getHealth();
     aStats = pool.getStats().find((s) => s.url === 'a')!;
     expect(aStats.totalSuccesses).toBe(1);
-    expect(aStats.score).toBe(77); // 75 + successBonus
+    expect(aStats.score).toBe(77);
     expect(pool.preferredUrl).toBe('a');
   });
 
@@ -349,7 +337,6 @@ describe('SorobanRpcPool', () => {
     await pool.getHealth();
     const stats: SorobanRpcNodeStats[] = pool.getStats();
     expect(stats).toHaveLength(2);
-    // Ordered by preference: b first.
     expect(stats[0].url).toBe('b');
     expect(stats[0].totalSuccesses).toBe(1);
     expect(stats[1].url).toBe('a');
@@ -368,8 +355,6 @@ describe('SorobanRpcPool', () => {
     expect(stats.find((s) => s.url === 'b')!.totalSuccesses).toBe(1);
   });
 });
-
-// ── resolveSorobanRpcUrls ────────────────────────────────────────────────
 
 describe('resolveSorobanRpcUrls', () => {
   it('prefers an explicit rpcUrls array', () => {
@@ -405,8 +390,6 @@ describe('resolveSorobanRpcUrls', () => {
     ).toEqual(['https://one.example', 'https://two.example']);
   });
 });
-
-// ── Integration through the real SDK fetch client ────────────────────────
 
 describe('SorobanRpcPool (SDK fetch-client integration)', () => {
   interface Route {
@@ -499,8 +482,6 @@ describe('SorobanRpcPool (SDK fetch-client integration)', () => {
   });
 });
 
-// ── getOrCreatePool: cached pools + per-call status listeners ───────────
-
 describe('getOrCreatePool (caching and status listeners)', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -541,7 +522,6 @@ describe('getOrCreatePool (caching and status listeners)', () => {
     const onStatusUpdate = vi.fn();
     const pool = getOrCreatePool(['http://node-a', 'http://node-b'], onStatusUpdate);
 
-    // node-a rate-limits, so the pool retries on node-b and notifies the listener.
     await expect(pool.getHealth()).resolves.toEqual({ status: 'healthy' });
     expect(onStatusUpdate).toHaveBeenCalled();
     expect(onStatusUpdate.mock.calls[0][0]).toMatch(/RPC node unavailable/);

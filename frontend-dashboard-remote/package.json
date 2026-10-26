@@ -16,6 +16,7 @@
     "@ledgerhq/hw-app-str": "^7.7.7",
     "@ledgerhq/hw-transport-web-ble": "^6.35.0",
     "@ledgerhq/hw-transport-webusb": "^6.35.0",
+    "@pactum/soroban-client": "file:../packages/soroban-client",
     "@stellar/freighter-api": "^6.0.1",
     "@stellar/stellar-sdk": "^16.2.0",
     "@tanstack/react-query": "^5.101.4",

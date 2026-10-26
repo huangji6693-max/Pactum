@@ -20,6 +20,7 @@ import {
 } from '@web3auth/base';
 import { CommonPrivateKeyProvider } from '@web3auth/base-provider';
 import { Web3Auth } from '@web3auth/modal';
+import { registerWeb3AuthSigner } from '@pactum/soroban-client';
 import { isStellarAddress } from './stellar';
 import { WalletConnectionError, type WalletConnectionResult } from './wallet';
 import { stellarKeypairFromWeb3AuthPrivateKey } from './web3authDerive';
@@ -179,6 +180,8 @@ export function signTransactionWithWeb3Auth(
   (tx as { sign: (kp: Keypair) => void }).sign(keypair);
   return tx.toXDR();
 }
+
+registerWeb3AuthSigner(signTransactionWithWeb3Auth);
 
 /** @internal test helper */
 export function __resetWeb3AuthForTests(): void {

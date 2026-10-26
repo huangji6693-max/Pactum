@@ -21,7 +21,7 @@ import {
   decodeSorobanError,
   TRANSACTION_FAILED_MESSAGE,
 } from './errors';
-import { SorobanSimulationError, extractDiagnosticEventBlobs } from './soroban';
+import { SorobanSimulationError, extractDiagnosticEventBlobs } from '@pactum/soroban-client';
 
 // ---------------------------------------------------------------------------
 // isSorobanXdrError

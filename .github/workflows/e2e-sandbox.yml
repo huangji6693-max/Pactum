@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'frontend/**'
+      - 'packages/soroban-client/**'
       - 'contracts/**'
       - 'backend/**'
       - 'scripts/e2e/**'
@@ -78,6 +79,10 @@ jobs:
         run: |
           rm -rf node_modules
           npm ci --include=optional
+
+      - name: Build @pactum/soroban-client
+        working-directory: packages/soroban-client
+        run: npm run build
 
       # playwright.config.ts's webServer also builds+previews the dashboard/wizard Module
       # Federation remotes (see docs/module-federation.md) since the host now lazy-loads them

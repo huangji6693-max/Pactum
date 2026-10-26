@@ -5,7 +5,7 @@ import {
   DEFAULT_NETWORK_PASSPHRASE,
   fetchLatestLedgerAnchor,
   fetchReputationFromRpc,
-} from './soroban';
+} from '@pactum/soroban-client';
 
 export type ReputationIntegrity = 'verified' | 'rpc-fallback';
 
