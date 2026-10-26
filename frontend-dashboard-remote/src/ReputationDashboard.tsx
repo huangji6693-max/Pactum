@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import UserProfile from './components/UserProfile';
+import AttestorStakingModal from './components/AttestorStakingModal';
 import { fetchCommitments, exportCommitments } from './lib/api';
 import type { Commitment, Reputation, ExportFormat } from './lib/api';
 import { fetchVerifiedReputation, type ReputationIntegrity } from './lib/verifiedReputation';
@@ -65,6 +66,7 @@ export const ReputationDashboard: React.FC<ReputationDashboardProps> = ({
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [isExporting, setIsExporting] = useState<ExportFormat | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [isStakingModalOpen, setIsStakingModalOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isFetchingRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -591,6 +593,26 @@ export const ReputationDashboard: React.FC<ReputationDashboardProps> = ({
               {totalCount > 0 ? `${fulfillmentRate}` : '0'}
             </span>
           </div>
+
+          <button
+            type="button"
+            data-testid="open-attestor-staking-btn"
+            onClick={() => setIsStakingModalOpen(true)}
+            style={{
+              background: '#4f46e5',
+              color: '#ffffff',
+              border: 'none',
+              borderRadius: '12px',
+              padding: '10px 16px',
+              fontSize: '12px',
+              fontWeight: '700',
+              cursor: 'pointer',
+              whiteSpace: 'nowrap',
+              boxShadow: '0 4px 12px rgba(79,70,229,0.22)',
+            }}
+          >
+            Attestor Staking & Disputes
+          </button>
         </div>
       </div>
 
@@ -1324,6 +1346,13 @@ export const ReputationDashboard: React.FC<ReputationDashboardProps> = ({
           </div>
         )}
       </div>
+
+      <AttestorStakingModal
+        isOpen={isStakingModalOpen}
+        onClose={() => setIsStakingModalOpen(false)}
+        attestorAddress={wallet.address || activeAddress}
+        walletProvider={wallet.provider ?? 'freighter'}
+      />
     </div>
   );
 };

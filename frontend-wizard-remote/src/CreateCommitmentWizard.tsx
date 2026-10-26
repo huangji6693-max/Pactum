@@ -117,6 +117,21 @@ function showErrorToast(message: string): void {
   container.appendChild(toast);
 }
 
+const STAKED_ATTESTOR_CANDIDATES = [
+  {
+    label: 'Attestor Alpha (500 XLM Staked)',
+    address: 'GAJKUMA6V4MJKQPFM4MXNMWQZX3CTMK2KMMCSZQPK5JXBZWBZM7S4C',
+  },
+  {
+    label: 'Attestor Beta (750 XLM Staked)',
+    address: 'GB4UFBX57KE2RPEXB4NCPQHXL5UZL7HSFBVQ2YEZQDZ2DXR2X3CHHZX',
+  },
+  {
+    label: 'Attestor Gamma (1,200 XLM Staked)',
+    address: 'GNEWADDRESSWITHNOCOMMITMENTSHISTORY123456789012345678',
+  },
+];
+
 export default function CreateCommitmentWizard({
   onSubmit,
   onSuccess,
@@ -160,6 +175,16 @@ export default function CreateCommitmentWizard({
   // Resolved after the consent modal signs and encrypts (used in reset)
   const [encryptResolve, setEncryptResolve] = useState<((r: EncryptResult) => void) | null>(null);
   const [encryptReject, setEncryptReject] = useState<((e: Error) => void) | null>(null);
+
+  // ── M-of-N Attestor Staking Panel state (#296) ─────────────────────────
+  const [resolutionMode, setResolutionMode] = useState<'single' | 'panel'>('single');
+  const [selectedAttestors, setSelectedAttestors] = useState<string[]>([
+    STAKED_ATTESTOR_CANDIDATES[0].address,
+    STAKED_ATTESTOR_CANDIDATES[1].address,
+    STAKED_ATTESTOR_CANDIDATES[2].address,
+  ]);
+  const [voteThreshold, setVoteThreshold] = useState<number>(2);
+  const [customAttestorInput, setCustomAttestorInput] = useState<string>('');
 
   const [simulationPreview, setSimulationPreview] = useState<SimulationPreview | null>(null);
   const [showSimModal, setShowSimModal] = useState(false);
@@ -388,6 +413,11 @@ export default function CreateCommitmentWizard({
         // 4 fails simulation with a MismatchingParameterLen host error regardless of
         // whether the real submission would have succeeded.
         const arbitratorAddress = await fetchArbitrator(rpcUrl, contractId, networkPassphrase);
+        const panelAttestors = resolutionMode === 'panel' ? selectedAttestors : [];
+        const panelThreshold =
+          resolutionMode === 'panel' && panelAttestors.length > 0
+            ? Math.min(Math.max(1, voteThreshold), panelAttestors.length)
+            : 0;
         const simTx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase })
           .addOperation(
             contract.call(
@@ -399,8 +429,8 @@ export default function CreateCommitmentWizard({
               Address.fromString(arbitratorAddress).toScVal(),
               xdr.ScVal.scvVoid(),
               xdr.ScVal.scvVoid(),
-              xdr.ScVal.scvVec([]),
-              xdr.ScVal.scvU32(0),
+              xdr.ScVal.scvVec(panelAttestors.map((a) => Address.fromString(a).toScVal())),
+              xdr.ScVal.scvU32(panelThreshold),
             ),
           )
           .setTimeout(60)
@@ -478,6 +508,11 @@ export default function CreateCommitmentWizard({
         counterpartyAddress: data.counterparty,
         termsHashHex,
         dueAtSeconds,
+        attestors: resolutionMode === 'panel' ? selectedAttestors : [],
+        voteThreshold:
+          resolutionMode === 'panel' && selectedAttestors.length > 0
+            ? Math.min(Math.max(1, voteThreshold), selectedAttestors.length)
+            : 0,
         walletProvider: provider ?? 'freighter',
         onStatusUpdate: (msg: string) => setStatusMessage(msg),
       });
@@ -1067,6 +1102,214 @@ export default function CreateCommitmentWizard({
                   )}
                 </div>
 
+                {/* Dispute Resolution Mode Selector (#296) */}
+                <div
+                  className="form-group"
+                  data-testid="wizard-dispute-resolution-panel"
+                  style={{
+                    marginTop: '14px',
+                    padding: '14px',
+                    borderRadius: '12px',
+                    border: '1px solid #e2e8f0',
+                    background: '#f8fafc',
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: '12.5px',
+                      fontWeight: 800,
+                      color: '#0f172a',
+                      marginBottom: '8px',
+                    }}
+                  >
+                    Dispute Resolution Mechanism
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+                    <button
+                      type="button"
+                      data-testid="resolution-mode-single"
+                      onClick={() => setResolutionMode('single')}
+                      style={{
+                        flex: 1,
+                        padding: '8px 12px',
+                        borderRadius: '8px',
+                        fontSize: '12px',
+                        fontWeight: 700,
+                        border:
+                          resolutionMode === 'single' ? '1.5px solid #4f46e5' : '1px solid #cbd5e1',
+                        background: resolutionMode === 'single' ? '#eef2ff' : '#ffffff',
+                        color: resolutionMode === 'single' ? '#312e81' : '#475569',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      Single Arbitrator (Default)
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="resolution-mode-panel"
+                      onClick={() => setResolutionMode('panel')}
+                      style={{
+                        flex: 1,
+                        padding: '8px 12px',
+                        borderRadius: '8px',
+                        fontSize: '12px',
+                        fontWeight: 700,
+                        border:
+                          resolutionMode === 'panel' ? '1.5px solid #4f46e5' : '1px solid #cbd5e1',
+                        background: resolutionMode === 'panel' ? '#eef2ff' : '#ffffff',
+                        color: resolutionMode === 'panel' ? '#312e81' : '#475569',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      M-of-N Attestor Staking Panel
+                    </button>
+                  </div>
+
+                  {resolutionMode === 'panel' && (
+                    <div data-testid="attestor-panel-config" style={{ marginTop: '10px' }}>
+                      <div
+                        style={{
+                          fontSize: '11.5px',
+                          fontWeight: 700,
+                          color: '#334155',
+                          marginBottom: '6px',
+                        }}
+                      >
+                        Select Staked Attestors ({selectedAttestors.length} selected)
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                        {STAKED_ATTESTOR_CANDIDATES.map((candidate) => {
+                          const checked = selectedAttestors.includes(candidate.address);
+                          return (
+                            <label
+                              key={candidate.address}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '8px',
+                                fontSize: '12px',
+                                background: '#ffffff',
+                                border: '1px solid #e2e8f0',
+                                borderRadius: '8px',
+                                padding: '6px 10px',
+                                cursor: 'pointer',
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(e) => {
+                                  const next = e.target.checked
+                                    ? [...selectedAttestors, candidate.address]
+                                    : selectedAttestors.filter((a) => a !== candidate.address);
+                                  setSelectedAttestors(next);
+                                  if (voteThreshold > next.length && next.length > 0) {
+                                    setVoteThreshold(next.length);
+                                  }
+                                }}
+                              />
+                              <span style={{ fontWeight: 700, color: '#0f172a' }}>
+                                {candidate.label}
+                              </span>
+                              <span
+                                style={{
+                                  fontFamily: 'monospace',
+                                  fontSize: '11px',
+                                  color: '#64748b',
+                                }}
+                              >
+                                ({candidate.address.slice(0, 8)}…)
+                              </span>
+                            </label>
+                          );
+                        })}
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+                        <input
+                          type="text"
+                          data-testid="custom-attestor-input"
+                          value={customAttestorInput}
+                          onChange={(e) => setCustomAttestorInput(e.target.value)}
+                          placeholder="Add custom staked attestor (G...)"
+                          style={{
+                            flex: 1,
+                            border: '1px solid #cbd5e1',
+                            borderRadius: '8px',
+                            padding: '6px 10px',
+                            fontSize: '12px',
+                            fontFamily: 'monospace',
+                          }}
+                        />
+                        <button
+                          type="button"
+                          data-testid="add-custom-attestor-btn"
+                          onClick={() => {
+                            const trimmed = customAttestorInput.trim();
+                            if (trimmed.startsWith('G') && !selectedAttestors.includes(trimmed)) {
+                              setSelectedAttestors([...selectedAttestors, trimmed]);
+                              setCustomAttestorInput('');
+                            }
+                          }}
+                          style={{
+                            background: '#0f172a',
+                            color: '#ffffff',
+                            border: 'none',
+                            borderRadius: '8px',
+                            padding: '6px 12px',
+                            fontSize: '11.5px',
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          Add Attestor
+                        </button>
+                      </div>
+
+                      <div
+                        style={{
+                          marginTop: '10px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                        }}
+                      >
+                        <label
+                          htmlFor="wizard-vote-threshold"
+                          style={{ fontSize: '12px', fontWeight: 700, color: '#334155' }}
+                        >
+                          Quorum Threshold (M of {selectedAttestors.length}):
+                        </label>
+                        <input
+                          id="wizard-vote-threshold"
+                          data-testid="wizard-vote-threshold"
+                          type="number"
+                          min={1}
+                          max={Math.max(1, selectedAttestors.length)}
+                          value={voteThreshold}
+                          onChange={(e) =>
+                            setVoteThreshold(
+                              Math.min(
+                                Math.max(1, Number(e.target.value) || 1),
+                                Math.max(1, selectedAttestors.length),
+                              ),
+                            )
+                          }
+                          style={{
+                            width: '72px',
+                            border: '1px solid #cbd5e1',
+                            borderRadius: '8px',
+                            padding: '4px 8px',
+                            fontSize: '12.5px',
+                            fontWeight: 800,
+                            textAlign: 'center',
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 <div className="wizard-review">
                   <div className="wizard-review-title">Review Details</div>
                   <div className="detail-panel">
@@ -1089,6 +1332,14 @@ export default function CreateCommitmentWizard({
                     <div className="detail-row">
                       <span className="detail-key">Unix Ts</span>
                       <span className="detail-val mono">{dueAtUnix ?? '—'}</span>
+                    </div>
+                    <div className="detail-row">
+                      <span className="detail-key">Dispute Panel</span>
+                      <span className="detail-val" data-testid="review-dispute-panel">
+                        {resolutionMode === 'panel'
+                          ? `${voteThreshold}-of-${selectedAttestors.length} Staked Attestor Quorum`
+                          : 'Single Arbitrator (Default)'}
+                      </span>
                     </div>
                   </div>
                 </div>

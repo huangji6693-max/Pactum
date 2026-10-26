@@ -259,6 +259,12 @@ export interface CreateCommitmentParams {
   termsHashHex: string;
   dueAtSeconds: number;
   /**
+   * Optional M-of-N attestor panel addresses (`Vec<Address>`) and quorum threshold (`u32`).
+   * When omitted or empty, defaults to single-resolver dispute resolution (`[]`, `0`).
+   */
+  attestors?: string[];
+  voteThreshold?: number;
+  /**
    * Ordered list of Soroban RPC endpoints (connection pool). When omitted,
    * `VITE_SOROBAN_RPC_URLS` / `VITE_SOROBAN_RPC_URL` / defaults are used.
    */
@@ -534,6 +540,8 @@ export async function submitCreateCommitment({
   counterpartyAddress,
   termsHashHex,
   dueAtSeconds,
+  attestors,
+  voteThreshold,
   rpcUrls,
   rpcUrl,
   contractId = import.meta.env.VITE_PACTUM_CONTRACT_ID || DEFAULT_CONTRACT_ID,
@@ -556,6 +564,15 @@ export async function submitCreateCommitment({
   if (dueAtSeconds <= nowSeconds) {
     throw new Error(
       `Due date must be in the future. Selected timestamp (${dueAtSeconds}) is not > current timestamp (${nowSeconds}).`,
+    );
+  }
+
+  const normalizedAttestors = (attestors ?? []).map((a) => a.trim()).filter(Boolean);
+  const resolvedThreshold =
+    normalizedAttestors.length > 0 ? Math.max(1, Number(voteThreshold ?? 1)) : 0;
+  if (normalizedAttestors.length > 0 && resolvedThreshold > normalizedAttestors.length) {
+    throw new Error(
+      `Vote threshold (${resolvedThreshold}) cannot exceed attestor panel size (${normalizedAttestors.length}).`,
     );
   }
 
@@ -584,8 +601,11 @@ export async function submitCreateCommitment({
   const schemaIdScVal = xdr.ScVal.scvVoid();
   // Empty attestors + a 0 threshold is the contract's explicitly-designed "no voting panel, use
   // the single-resolver dispute path" state (contracts/registry/src/commitments.rs::create).
-  const attestorsScVal = xdr.ScVal.scvVec([]);
-  const voteThresholdScVal = xdr.ScVal.scvU32(0);
+  // When an M-of-N attestor panel is configured, encode the panel addresses and quorum threshold.
+  const attestorsScVal = xdr.ScVal.scvVec(
+    normalizedAttestors.map((addr) => Address.fromString(addr).toScVal()),
+  );
+  const voteThresholdScVal = xdr.ScVal.scvU32(resolvedThreshold);
 
   // 3. Build Transaction Envelope
   onStatusUpdate?.('Fetching sequence number for issuer account...');
@@ -777,4 +797,427 @@ export async function submitCreateCommitment({
     commitmentId,
     status: 'SUCCESS',
   };
+}
+
+// ---------------------------------------------------------------------------
+// Attestor Staking, Unbonding, Slashing & Dispute Committee Helpers (#296)
+// ---------------------------------------------------------------------------
+
+/** 14-day unbonding period in seconds (`14 * 24 * 60 * 60 = 1_209_600`). */
+export const UNBONDING_PERIOD_SECONDS = 14 * 24 * 60 * 60;
+
+/** 7-day voting window for disputed M-of-N commitments (`7 * 24 * 60 * 60 = 604_800`). */
+export const ATTESTOR_VOTE_TIMEOUT_SECONDS = 7 * 24 * 60 * 60;
+
+/** 10% stake slashing rate applied to dissenting panel voters when quorum resolves. */
+export const SLASH_PERCENT = 10;
+
+export type DisputeVoteOutcome = 'Fulfilled' | 'Late' | 'Breached';
+
+export interface AttestorStakeInfo {
+  attestor: string;
+  staked: bigint;
+  unbondingUntil: number | null;
+  locked: boolean;
+  canFinalizeUnstake: boolean;
+  remainingUnbondingSeconds: number;
+}
+
+export interface ActiveDisputeAssignment {
+  commitmentId: number;
+  issuer: string;
+  counterparty: string;
+  attestors: string[];
+  voteThreshold: number;
+  votesCast: {
+    fulfilled: number;
+    late: number;
+    breached: number;
+  };
+  deadlineSeconds: number;
+  hasVoted?: boolean;
+  votedOutcome?: DisputeVoteOutcome;
+}
+
+export function formatUnbondingCountdown(
+  unbondingUntilSeconds: number | null,
+  nowSeconds = Math.floor(Date.now() / 1000),
+): {
+  remainingSeconds: number;
+  canFinalize: boolean;
+  progressPercent: number;
+  label: string;
+} {
+  if (unbondingUntilSeconds === null || unbondingUntilSeconds <= 0) {
+    return {
+      remainingSeconds: 0,
+      canFinalize: false,
+      progressPercent: 0,
+      label: 'No active unbonding request',
+    };
+  }
+
+  const remaining = Math.max(0, unbondingUntilSeconds - nowSeconds);
+  if (remaining === 0) {
+    return {
+      remainingSeconds: 0,
+      canFinalize: true,
+      progressPercent: 100,
+      label: 'Unbonding complete — Ready to withdraw',
+    };
+  }
+
+  const days = Math.floor(remaining / 86_400);
+  const hours = Math.floor((remaining % 86_400) / 3_600);
+  const minutes = Math.floor((remaining % 3_600) / 60);
+  const elapsed = Math.max(0, UNBONDING_PERIOD_SECONDS - remaining);
+  const progressPercent = Math.min(99, Math.round((elapsed / UNBONDING_PERIOD_SECONDS) * 100));
+
+  return {
+    remainingSeconds: remaining,
+    canFinalize: false,
+    progressPercent,
+    label: `${days}d ${hours}h ${minutes}m remaining`,
+  };
+}
+
+export function calculateSlashedBalance(
+  stakedAmount: bigint,
+  slashPercent = SLASH_PERCENT,
+): {
+  slashedCut: bigint;
+  remainingStake: bigint;
+} {
+  if (stakedAmount <= 0n || slashPercent <= 0) {
+    return { slashedCut: 0n, remainingStake: stakedAmount > 0n ? stakedAmount : 0n };
+  }
+  const pct = BigInt(Math.min(100, Math.max(0, slashPercent)));
+  const slashedCut = (stakedAmount * pct) / 100n;
+  const remainingStake = stakedAmount - slashedCut;
+  return { slashedCut, remainingStake };
+}
+
+export async function fetchAttestorStakeInfo(
+  attestorAddress: string,
+  options: ReputationQueryOptions & { nowSeconds?: number } = {},
+): Promise<AttestorStakeInfo> {
+  const contractId =
+    options.contractId || import.meta.env.VITE_PACTUM_CONTRACT_ID || DEFAULT_CONTRACT_ID;
+  const networkPassphrase =
+    options.networkPassphrase ||
+    import.meta.env.VITE_STELLAR_NETWORK_PASSPHRASE ||
+    DEFAULT_NETWORK_PASSPHRASE;
+  const pool = getOrCreatePool(resolveSorobanRpcUrls(options.rpcUrls, options.rpcUrl));
+  const contract = new Contract(contractId);
+  const source = new Account(Keypair.random().publicKey(), '0');
+
+  const transaction = new TransactionBuilder(source, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(
+      contract.call('get_stake_info', nativeToScVal(attestorAddress, { type: 'address' })),
+    )
+    .setTimeout(30)
+    .build();
+
+  const simulation = await pool.simulateTransaction(transaction);
+  if (rpc.Api.isSimulationError(simulation)) {
+    const diagnosticBlobs = extractDiagnosticEventBlobs(simulation);
+    const decoded = decodeSimulationError(simulation.error, diagnosticBlobs, 'get_stake_info');
+    throw new SorobanSimulationError(
+      decoded.message ?? `Failed to read attestor stake info: ${simulation.error}`,
+      simulation.error,
+      diagnosticBlobs,
+      'get_stake_info',
+    );
+  }
+  if (!simulation.result) {
+    throw new Error('Direct Soroban query returned no stake info');
+  }
+
+  const raw = (scValToNative(simulation.result.retval) ?? {}) as Record<string, unknown>;
+  const stakedRaw = raw.staked ?? 0;
+  const staked = typeof stakedRaw === 'bigint' ? stakedRaw : BigInt(String(stakedRaw));
+  const unbondingRaw = raw.unbonding_until ?? raw.unbondingUntil ?? null;
+  const unbondingUntil =
+    unbondingRaw === null || unbondingRaw === undefined ? null : Number(unbondingRaw);
+  const locked = Boolean(raw.locked);
+
+  const countdown = formatUnbondingCountdown(unbondingUntil, options.nowSeconds);
+
+  return {
+    attestor: attestorAddress,
+    staked,
+    unbondingUntil,
+    locked,
+    canFinalizeUnstake: countdown.canFinalize && !locked && staked > 0n,
+    remainingUnbondingSeconds: countdown.remainingSeconds,
+  };
+}
+
+async function executeAttestorContractTx({
+  methodName,
+  args,
+  signerAddress,
+  walletProvider = 'freighter',
+  rpcUrls,
+  rpcUrl,
+  contractId = import.meta.env.VITE_PACTUM_CONTRACT_ID || DEFAULT_CONTRACT_ID,
+  networkPassphrase = import.meta.env.VITE_STELLAR_NETWORK_PASSPHRASE || DEFAULT_NETWORK_PASSPHRASE,
+  onStatusUpdate,
+}: {
+  methodName: string;
+  args: xdr.ScVal[];
+  signerAddress: string;
+  walletProvider?: WalletProvider;
+  rpcUrls?: string[];
+  rpcUrl?: string;
+  contractId?: string;
+  networkPassphrase?: string;
+  onStatusUpdate?: (msg: string) => void;
+}): Promise<{ hash: string; status: 'SUCCESS' }> {
+  onStatusUpdate?.(`Preparing ${methodName} transaction...`);
+  const pool = getOrCreatePool(resolveSorobanRpcUrls(rpcUrls, rpcUrl), onStatusUpdate);
+  const account = await pool.getAccount(signerAddress);
+  const contract = new Contract(contractId);
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(contract.call(methodName, ...args))
+    .setTimeout(60)
+    .build();
+
+  const preparedTx = await pool.prepareTransaction(tx);
+  const unsignedXdr = preparedTx.toXDR();
+
+  let signedXdr = '';
+  if (walletProvider === 'ledger') {
+    onStatusUpdate?.('Awaiting signature on Ledger device...');
+    signedXdr = await signTransactionWithLedger(unsignedXdr, networkPassphrase);
+  } else if (walletProvider === 'web3auth') {
+    onStatusUpdate?.('Signing with social-login Stellar key...');
+    const { signTransactionWithWeb3Auth } = await import('./web3auth');
+    signedXdr = signTransactionWithWeb3Auth(unsignedXdr, networkPassphrase);
+  } else {
+    onStatusUpdate?.('Awaiting signature in Freighter wallet...');
+    const signResult = await signTransaction(unsignedXdr, {
+      networkPassphrase,
+      address: signerAddress,
+    });
+    if (typeof signResult === 'string') {
+      signedXdr = signResult;
+    } else if (signResult && typeof signResult === 'object') {
+      if ((signResult as any).error) {
+        throw new Error(`Freighter signing rejected: ${(signResult as any).error}`);
+      }
+      signedXdr =
+        (signResult as any).signedTxXdr ||
+        (signResult as any).signedXdr ||
+        (signResult as any).signedTransaction ||
+        '';
+    }
+  }
+
+  if (!signedXdr) {
+    throw new Error('Transaction signing was cancelled or denied.');
+  }
+
+  onStatusUpdate?.('Submitting transaction to Stellar Testnet...');
+  const signedTx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
+  const sendResult = await pool.sendTransaction(signedTx);
+  if (sendResult.status === 'ERROR' || sendResult.errorResult) {
+    throw new Error(`RPC submission error: ${sendResult.errorResult || sendResult.status}`);
+  }
+
+  const txHash = sendResult.hash;
+  let attempts = 0;
+  while (attempts < 25) {
+    attempts++;
+    const txResult = await pool.getTransaction(txHash);
+    if (txResult.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+      return { hash: txHash, status: 'SUCCESS' };
+    }
+    if (txResult.status === rpc.Api.GetTransactionStatus.FAILED) {
+      throw new Error(`Transaction execution failed on Stellar Testnet. Hash: ${txHash}`);
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  throw new Error(`Transaction confirmation timed out. Hash: ${txHash}`);
+}
+
+export async function submitStakeAttestor({
+  attestorAddress,
+  amountStroops,
+  walletProvider = 'freighter',
+  rpcUrls,
+  rpcUrl,
+  contractId,
+  networkPassphrase,
+  onStatusUpdate,
+}: {
+  attestorAddress: string;
+  amountStroops: bigint | number | string;
+  walletProvider?: WalletProvider;
+  rpcUrls?: string[];
+  rpcUrl?: string;
+  contractId?: string;
+  networkPassphrase?: string;
+  onStatusUpdate?: (msg: string) => void;
+}): Promise<{ hash: string; status: 'SUCCESS' }> {
+  const amountBigInt =
+    typeof amountStroops === 'bigint' ? amountStroops : BigInt(String(amountStroops));
+  if (amountBigInt <= 0n) {
+    throw new Error('Stake amount must be strictly greater than zero.');
+  }
+
+  return executeAttestorContractTx({
+    methodName: 'stake_attestor',
+    args: [
+      Address.fromString(attestorAddress).toScVal(),
+      nativeToScVal(amountBigInt, { type: 'i128' }),
+    ],
+    signerAddress: attestorAddress,
+    walletProvider,
+    rpcUrls,
+    rpcUrl,
+    contractId,
+    networkPassphrase,
+    onStatusUpdate,
+  });
+}
+
+export async function submitRequestUnstake({
+  attestorAddress,
+  walletProvider = 'freighter',
+  rpcUrls,
+  rpcUrl,
+  contractId,
+  networkPassphrase,
+  onStatusUpdate,
+}: {
+  attestorAddress: string;
+  walletProvider?: WalletProvider;
+  rpcUrls?: string[];
+  rpcUrl?: string;
+  contractId?: string;
+  networkPassphrase?: string;
+  onStatusUpdate?: (msg: string) => void;
+}): Promise<{ hash: string; unbondingUntil: number; status: 'SUCCESS' }> {
+  const res = await executeAttestorContractTx({
+    methodName: 'request_unstake',
+    args: [Address.fromString(attestorAddress).toScVal()],
+    signerAddress: attestorAddress,
+    walletProvider,
+    rpcUrls,
+    rpcUrl,
+    contractId,
+    networkPassphrase,
+    onStatusUpdate,
+  });
+  const unbondingUntil = Math.floor(Date.now() / 1000) + UNBONDING_PERIOD_SECONDS;
+  return { ...res, unbondingUntil };
+}
+
+export async function submitFinalizeUnstake({
+  attestorAddress,
+  walletProvider = 'freighter',
+  rpcUrls,
+  rpcUrl,
+  contractId,
+  networkPassphrase,
+  onStatusUpdate,
+}: {
+  attestorAddress: string;
+  walletProvider?: WalletProvider;
+  rpcUrls?: string[];
+  rpcUrl?: string;
+  contractId?: string;
+  networkPassphrase?: string;
+  onStatusUpdate?: (msg: string) => void;
+}): Promise<{ hash: string; status: 'SUCCESS' }> {
+  return executeAttestorContractTx({
+    methodName: 'finalize_unstake',
+    args: [Address.fromString(attestorAddress).toScVal()],
+    signerAddress: attestorAddress,
+    walletProvider,
+    rpcUrls,
+    rpcUrl,
+    contractId,
+    networkPassphrase,
+    onStatusUpdate,
+  });
+}
+
+export async function submitCastDisputeVote({
+  attestorAddress,
+  commitmentId,
+  outcome,
+  walletProvider = 'freighter',
+  rpcUrls,
+  rpcUrl,
+  contractId,
+  networkPassphrase,
+  onStatusUpdate,
+}: {
+  attestorAddress: string;
+  commitmentId: number | bigint;
+  outcome: DisputeVoteOutcome;
+  walletProvider?: WalletProvider;
+  rpcUrls?: string[];
+  rpcUrl?: string;
+  contractId?: string;
+  networkPassphrase?: string;
+  onStatusUpdate?: (msg: string) => void;
+}): Promise<{ hash: string; status: 'SUCCESS' }> {
+  return executeAttestorContractTx({
+    methodName: 'cast_dispute_vote',
+    args: [
+      Address.fromString(attestorAddress).toScVal(),
+      xdr.ScVal.scvU64(xdr.Uint64.fromString(String(commitmentId))),
+      xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(outcome)]),
+    ],
+    signerAddress: attestorAddress,
+    walletProvider,
+    rpcUrls,
+    rpcUrl,
+    contractId,
+    networkPassphrase,
+    onStatusUpdate,
+  });
+}
+
+export async function submitCheckDisputeTimeout({
+  callerAddress,
+  commitmentId,
+  walletProvider = 'freighter',
+  rpcUrls,
+  rpcUrl,
+  contractId,
+  networkPassphrase,
+  onStatusUpdate,
+}: {
+  callerAddress: string;
+  commitmentId: number | bigint;
+  walletProvider?: WalletProvider;
+  rpcUrls?: string[];
+  rpcUrl?: string;
+  contractId?: string;
+  networkPassphrase?: string;
+  onStatusUpdate?: (msg: string) => void;
+}): Promise<{ hash: string; status: 'SUCCESS' }> {
+  return executeAttestorContractTx({
+    methodName: 'check_dispute_timeout',
+    args: [xdr.ScVal.scvU64(xdr.Uint64.fromString(String(commitmentId)))],
+    signerAddress: callerAddress,
+    walletProvider,
+    rpcUrls,
+    rpcUrl,
+    contractId,
+    networkPassphrase,
+    onStatusUpdate,
+  });
 }

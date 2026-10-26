@@ -94,6 +94,8 @@ export interface CreateCommitmentParams {
   counterpartyAddress: string;
   termsHashHex: string;
   dueAtSeconds: number;
+  attestors?: string[];
+  voteThreshold?: number;
   rpcUrl?: string;
   contractId?: string;
   networkPassphrase?: string;
@@ -340,6 +342,8 @@ export async function submitCreateCommitment({
   counterpartyAddress,
   termsHashHex,
   dueAtSeconds,
+  attestors,
+  voteThreshold,
   rpcUrl = import.meta.env.VITE_SOROBAN_RPC_URL || DEFAULT_SOROBAN_RPC_URL,
   contractId = import.meta.env.VITE_PACTUM_CONTRACT_ID || DEFAULT_CONTRACT_ID,
   networkPassphrase = import.meta.env.VITE_STELLAR_NETWORK_PASSPHRASE || DEFAULT_NETWORK_PASSPHRASE,
@@ -389,8 +393,18 @@ export async function submitCreateCommitment({
   const schemaIdScVal = xdr.ScVal.scvVoid();
   // Empty attestors + a 0 threshold is the contract's explicitly-designed "no voting panel, use
   // the single-resolver dispute path" state (contracts/registry/src/commitments.rs::create).
-  const attestorsScVal = xdr.ScVal.scvVec([]);
-  const voteThresholdScVal = xdr.ScVal.scvU32(0);
+  const normalizedAttestors = (attestors ?? []).map((a) => a.trim()).filter(Boolean);
+  const resolvedThreshold =
+    normalizedAttestors.length > 0 ? Math.max(1, Number(voteThreshold ?? 1)) : 0;
+  if (normalizedAttestors.length > 0 && resolvedThreshold > normalizedAttestors.length) {
+    throw new Error(
+      `Vote threshold (${resolvedThreshold}) cannot exceed attestor panel size (${normalizedAttestors.length}).`,
+    );
+  }
+  const attestorsScVal = xdr.ScVal.scvVec(
+    normalizedAttestors.map((addr) => Address.fromString(addr).toScVal()),
+  );
+  const voteThresholdScVal = xdr.ScVal.scvU32(resolvedThreshold);
 
   // 3. Build Transaction Envelope
   onStatusUpdate?.('Fetching sequence number for issuer account...');
