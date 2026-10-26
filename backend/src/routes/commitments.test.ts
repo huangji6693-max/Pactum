@@ -1,6 +1,16 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { encodeCursor, decodeCursor, commitmentQuerySchema, toApiCommitment } from './commitments';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import {
+  encodeCursor,
+  decodeCursor,
+  commitmentQuerySchema,
+  toApiCommitment,
+  analyticsRangeQuerySchema,
+  resolveContinuousAggregateView,
+} from './commitments';
+import { AnalyticsWorker, MANAGED_CONTINUOUS_AGGREGATES } from '../workers/analyticsWorker';
 
 describe('Cursor-Based Keyset Pagination & Filtering (Pactum #124)', () => {
   it('should encode and decode keyset cursor tokens correctly', () => {
@@ -96,5 +106,77 @@ describe('Cursor-Based Keyset Pagination & Filtering (Pactum #124)', () => {
       createdAt: '2026-08-23T12:57:57.608Z',
     });
     assert.equal(disputed.status, 'Disputed');
+  });
+
+  it('routes continuous aggregate queries across 1h, 1d, and 1w buckets (Issue #303)', () => {
+    assert.equal(
+      resolveContinuousAggregateView('commitments', '1h'),
+      'cagg_commitment_events_1h',
+    );
+    assert.equal(
+      resolveContinuousAggregateView('commitments', '1d'),
+      'cagg_commitment_events_1d',
+    );
+    assert.equal(
+      resolveContinuousAggregateView('commitments', '1w'),
+      'cagg_commitment_events_1w',
+    );
+    assert.equal(resolveContinuousAggregateView('attestors', '1h'), 'cagg_attestor_votes_1h');
+    assert.equal(resolveContinuousAggregateView('attestors', '1d'), 'cagg_attestor_votes_1d');
+    assert.equal(resolveContinuousAggregateView('attestors', '1w'), 'cagg_attestor_votes_1w');
+
+    const parsed = analyticsRangeQuerySchema.safeParse({
+      target: 'attestors',
+      bucket: '1h',
+      attestor: 'GATTESTOR123',
+      limit: '50',
+    });
+    assert.equal(parsed.success, true);
+    if (parsed.success) {
+      assert.equal(parsed.data.target, 'attestors');
+      assert.equal(parsed.data.bucket, '1h');
+      assert.equal(parsed.data.limit, 50);
+    }
+  });
+
+  it('notifies cache invalidation listeners when AnalyticsWorker invalidates CAGG views', () => {
+    const worker = new AnalyticsWorker();
+    const seen: string[][] = [];
+    const unsubscribe = worker.onCacheInvalidate((views) => seen.push(views));
+
+    worker.invalidateCaches(['cagg_commitment_events_1h', 'cagg_attestor_votes_1d']);
+    assert.equal(seen.length, 1);
+    assert.deepEqual(seen[0], ['cagg_commitment_events_1h', 'cagg_attestor_votes_1d']);
+
+    unsubscribe();
+    worker.invalidateCaches(['cagg_commitment_events_1w']);
+    assert.equal(seen.length, 1);
+    assert.ok(MANAGED_CONTINUOUS_AGGREGATES.includes('cagg_commitment_events_1h'));
+    assert.ok(MANAGED_CONTINUOUS_AGGREGATES.includes('cagg_attestor_votes_1w'));
+  });
+
+  it('defines 1h, 1d, and 1w real-time continuous aggregates in 012_timescale_continuous_aggregates.sql', () => {
+    const sqlPath = path.join(
+      __dirname,
+      '..',
+      'db',
+      'migrations',
+      '012_timescale_continuous_aggregates.sql',
+    );
+    const sql = fs.readFileSync(sqlPath, 'utf8');
+    for (const view of [
+      'cagg_commitment_events_1h',
+      'cagg_commitment_events_1d',
+      'cagg_commitment_events_1w',
+      'cagg_attestor_votes_1h',
+      'cagg_attestor_votes_1d',
+      'cagg_attestor_votes_1w',
+    ]) {
+      assert.ok(sql.includes(view), `Migration 012 should define ${view}`);
+    }
+    assert.ok(
+      sql.includes('timescaledb.materialized_only = false'),
+      'Migration 012 must enable real-time continuous aggregation',
+    );
   });
 });

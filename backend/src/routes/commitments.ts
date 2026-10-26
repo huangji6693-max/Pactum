@@ -36,6 +36,40 @@ export const commitmentQuerySchema = z.object({
 
 export type CommitmentQueryInput = z.infer<typeof commitmentQuerySchema>;
 
+export const analyticsRangeQuerySchema = z.object({
+  target: z.enum(['commitments', 'attestors']).default('commitments'),
+  bucket: z.enum(['1h', '1d', '1w']).default('1d'),
+  issuer: z.string().optional(),
+  attestor: z.string().optional(),
+  from: z.string().datetime({ offset: true }).optional(),
+  to: z.string().datetime({ offset: true }).optional(),
+  limit: z.coerce.number().int().min(1).max(500).default(100),
+});
+
+export type AnalyticsRangeQueryInput = z.infer<typeof analyticsRangeQuerySchema>;
+
+const CONTINUOUS_AGGREGATE_VIEW_MAP: Readonly<
+  Record<'commitments' | 'attestors', Readonly<Record<'1h' | '1d' | '1w', string>>>
+> = {
+  commitments: {
+    '1h': 'cagg_commitment_events_1h',
+    '1d': 'cagg_commitment_events_1d',
+    '1w': 'cagg_commitment_events_1w',
+  },
+  attestors: {
+    '1h': 'cagg_attestor_votes_1h',
+    '1d': 'cagg_attestor_votes_1d',
+    '1w': 'cagg_attestor_votes_1w',
+  },
+};
+
+export function resolveContinuousAggregateView(
+  target: 'commitments' | 'attestors',
+  bucket: '1h' | '1d' | '1w',
+): string {
+  return CONTINUOUS_AGGREGATE_VIEW_MAP[target][bucket];
+}
+
 export interface CommitmentOutcomeRow {
   time: string | Date;
   id: string | number;
@@ -172,6 +206,67 @@ router.post(
     }
   },
 );
+
+// GET /commitments/analytics - Query real-time TimescaleDB continuous aggregates (Issue #303)
+router.get('/analytics', async (req: Request, res: Response): Promise<void> => {
+  const parseResult = analyticsRangeQuerySchema.safeParse(req.query);
+  if (!parseResult.success) {
+    res.status(400).json({
+      error: 'Bad Request',
+      details: parseResult.error.issues,
+    });
+    return;
+  }
+
+  const { target, bucket, issuer, attestor, from, to, limit } = parseResult.data;
+  const viewName = resolveContinuousAggregateView(target, bucket);
+  const conditions: string[] = ['1=1'];
+  const params: unknown[] = [];
+
+  if (target === 'commitments' && issuer) {
+    params.push(issuer);
+    conditions.push(`issuer = $${params.length}`);
+  } else if (target === 'attestors' && attestor) {
+    params.push(attestor);
+    conditions.push(`attestor = $${params.length}`);
+  }
+
+  if (from) {
+    params.push(from);
+    conditions.push(`bucket >= $${params.length}::timestamptz`);
+  }
+
+  if (to) {
+    params.push(to);
+    conditions.push(`bucket <= $${params.length}::timestamptz`);
+  }
+
+  params.push(limit);
+  const sql = `
+    SELECT *
+    FROM ${viewName}
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY bucket DESC
+    LIMIT $${params.length}
+  `;
+
+  try {
+    const result = await pool.query(sql, params);
+    res.status(200).json({
+      view: viewName,
+      target,
+      bucket,
+      realtime: true,
+      items: result.rows ?? [],
+    });
+  } catch (error) {
+    logger.error('Failed to query continuous aggregate analytics', error, { viewName });
+    res.status(503).json({
+      error: 'Service Unavailable',
+      message: 'Failed to query TimescaleDB continuous aggregate.',
+    });
+  }
+});
 
 // GET /commitments/:id - Fetch a single commitment by its on-chain id.
 // Mounted after /export above so that path segment is never captured here.
