@@ -18,19 +18,22 @@ import { useWasmValidation } from './hooks/useWasmValidation';
 import {
   submitCreateCommitment,
   fundTestnetAccount,
-  preflightSimulate,
   fetchArbitrator,
   extractDiagnosticEventBlobs,
   type CreateCommitmentResult,
   type SimulationPreview,
   SorobanSimulationError,
 } from './lib/soroban';
+import {
+  runPreflightSimulation,
+  type PreflightSimulationReport,
+} from './hooks/usePreflightSimulation';
 import { decodeSimulationError } from './lib/xdrDecode';
 import { postEncryptedTerms, createCommitment } from './lib/api';
 import UserProfile from './components/UserProfile';
 import EncryptionConsentModal from './components/EncryptionConsentModal';
 import { SorobanErrorModal } from './components/SorobanErrorModal';
-import SimulationPreviewModal from './components/SimulationPreviewModal';
+import PreflightSimulationModal from './components/PreflightSimulationModal';
 import {
   CheckCircle2,
   ExternalLink,
@@ -161,7 +164,9 @@ export default function CreateCommitmentWizard({
   const [encryptResolve, setEncryptResolve] = useState<((r: EncryptResult) => void) | null>(null);
   const [encryptReject, setEncryptReject] = useState<((e: Error) => void) | null>(null);
 
-  const [simulationPreview, setSimulationPreview] = useState<SimulationPreview | null>(null);
+  const [simulationPreview, setSimulationPreview] = useState<
+    PreflightSimulationReport | SimulationPreview | null
+  >(null);
   const [showSimModal, setShowSimModal] = useState(false);
 
   /**
@@ -406,7 +411,15 @@ export default function CreateCommitmentWizard({
           .setTimeout(60)
           .build();
 
-        const preview = await preflightSimulate(simTx);
+        const preview = await runPreflightSimulation(simTx, {
+          rpcUrl,
+          sourceAddress: connectedAddress,
+          counterpartyAddress: data.counterparty,
+          operationName: 'create_commitment',
+          isEncrypted: encryptEnabled,
+          hasValidationRules: Boolean(dynamicRules),
+          checkAccountBalance: true,
+        });
         setSimulationPreview(preview);
 
         if (!preview.success) {
@@ -1181,7 +1194,7 @@ export default function CreateCommitmentWizard({
         />
       )}
 
-      <SimulationPreviewModal
+      <PreflightSimulationModal
         isOpen={showSimModal}
         preview={simulationPreview}
         onConfirm={() => {
