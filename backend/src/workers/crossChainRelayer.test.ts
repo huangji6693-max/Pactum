@@ -6,6 +6,12 @@ import {
   MemoryBatchStore,
   TrustScoreBatch,
 } from './crossChainRelayer';
+import {
+  runAsynchronousDkg,
+  FrostTssCoordinator,
+  verifyThresholdSignature,
+  modQ,
+} from '../crypto/tss';
 
 describe('CrossChainRelayer', () => {
   const dummyRegistryId = '0x1111111111111111111111111111111111111111111111111111111111111111';
@@ -77,5 +83,66 @@ describe('CrossChainRelayer', () => {
     await store.deleteBatch(42n);
     const deleted = await store.getBatch(42n);
     assert.equal(deleted, null);
+  });
+
+  it('relays batch with 3-of-5 FROST threshold signature while tolerating 2 offline nodes and slashing malicious share signers', async () => {
+    const dkg = await runAsynchronousDkg(3, 5);
+    const coordinator = new FrostTssCoordinator(dkg);
+
+    let capturedPayload = '';
+    let capturedCommitment = '';
+    let capturedZ = '';
+
+    const mockOracleContract = {
+      lastBatchNonce: async () => 0n,
+      receiveThresholdBatch: async (payload: string, commitmentAddress: string, z: string) => {
+        capturedPayload = payload;
+        capturedCommitment = commitmentAddress;
+        capturedZ = z;
+        return {
+          hash: '0xdeadbeef00000000000000000000000000000000000000000000000000000001',
+          wait: async () => ({
+            status: 1,
+            hash: '0xdeadbeef00000000000000000000000000000000000000000000000000000001',
+          }),
+        };
+      },
+    } as any;
+
+    const relayer = new CrossChainRelayer({} as any, mockOracleContract, {} as any, {
+      registryId: dummyRegistryId,
+      oracleContractAddress: '0x0000000000000000000000000000000000000001',
+      sourceChainId: 1001,
+      tssCoordinator: coordinator,
+    });
+
+    const entry: TrustScoreEntry = {
+      stellarAddress: '0x0000000000000000000000000000000000000000000000000000000000000007',
+      score: 98n,
+      fulfilledCount: 15,
+      lateCount: 1,
+      breachedCount: 0,
+      sourceLedgerSeq: 8000n,
+    };
+
+    const result = await relayer.submitBatchWithThresholdSignature([entry], {
+      offlineNodeIds: [5],
+      corruptShareHooks: {
+        3: (z) => modQ(z + 42n),
+      },
+    });
+
+    assert.equal(
+      result.txHash,
+      '0xdeadbeef00000000000000000000000000000000000000000000000000000001',
+    );
+    assert.deepEqual(result.signature.signers, [1, 2, 4]);
+    assert.equal(result.signature.slashedCulprits.length, 1);
+    assert.equal(result.signature.slashedCulprits[0].culpritNodeId, 3);
+    assert.equal(capturedCommitment, result.signature.commitmentAddress);
+    assert.equal(capturedZ, result.signature.z);
+
+    const expectedDigest = relayer.computeThresholdBatchDigest(1n, capturedPayload);
+    assert.equal(verifyThresholdSignature(expectedDigest, result.signature), true);
   });
 });

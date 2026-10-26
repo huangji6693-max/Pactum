@@ -327,4 +327,182 @@ describe('PactumTrustOracle', function () {
       expect(await oracle.registryId()).to.equal(newRegistry);
     });
   });
+
+  describe('FROST / TSS threshold signature relay (#299)', function () {
+    const SECP256K1_P = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fn;
+    const SECP256K1_Q = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+    const GX = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798n;
+    const GY = 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8n;
+    const G = { x: GX, y: GY };
+
+    function modP(n) {
+      const r = n % SECP256K1_P;
+      return r < 0n ? r + SECP256K1_P : r;
+    }
+    function modQ(n) {
+      const r = n % SECP256K1_Q;
+      return r < 0n ? r + SECP256K1_Q : r;
+    }
+    function modInv(a, m) {
+      let t = 0n,
+        newT = 1n,
+        r = m,
+        newR = ((a % m) + m) % m;
+      while (newR !== 0n) {
+        const q = r / newR;
+        [t, newT] = [newT, t - q * newT];
+        [r, newR] = [newR, r - q * newR];
+      }
+      return t < 0n ? t + m : t;
+    }
+    function pointDouble(p) {
+      if (p.inf || p.y === 0n) return { x: 0n, y: 0n, inf: true };
+      const s = modP(3n * p.x * p.x * modInv(2n * p.y, SECP256K1_P));
+      const x3 = modP(s * s - 2n * p.x);
+      const y3 = modP(s * (p.x - x3) - p.y);
+      return { x: x3, y: y3 };
+    }
+    function pointAdd(p1, p2) {
+      if (p1.inf) return p2;
+      if (p2.inf) return p1;
+      if (p1.x === p2.x) {
+        return modP(p1.y + p2.y) === 0n ? { x: 0n, y: 0n, inf: true } : pointDouble(p1);
+      }
+      const s = modP((p2.y - p1.y) * modInv(p2.x - p1.x, SECP256K1_P));
+      const x3 = modP(s * s - p1.x - p2.x);
+      const y3 = modP(s * (p1.x - x3) - p1.y);
+      return { x: x3, y: y3 };
+    }
+    function pointMul(p, scalar) {
+      let k = modQ(scalar);
+      let res = { x: 0n, y: 0n, inf: true };
+      let add = p;
+      while (k > 0n) {
+        if ((k & 1n) === 1n) res = pointAdd(res, add);
+        add = pointDouble(add);
+        k >>= 1n;
+      }
+      return res;
+    }
+    function pointToEthAddress(p) {
+      const uncompressed = p.x.toString(16).padStart(64, '0') + p.y.toString(16).padStart(64, '0');
+      const digest = ethers.keccak256('0x' + uncompressed);
+      return ethers.getAddress('0x' + digest.slice(26));
+    }
+    function lagrangeCoeff(i, subset) {
+      const bi = BigInt(i);
+      let num = 1n,
+        den = 1n;
+      for (const j of subset) {
+        if (j === i) continue;
+        const bj = BigInt(j);
+        num = modQ(num * bj);
+        den = modQ(den * modQ(bj - bi));
+      }
+      return modQ(num * modInv(den, SECP256K1_Q));
+    }
+
+    it('verifies a 3-of-5 FROST threshold signature on-chain and applies the bridged batch', async function () {
+      const { owner, other, oracle } = await loadFixture(deployFixture);
+
+      // 5-node Feldman/Pedersen DKG (threshold t = 3, nodes 1..5)
+      const nodePolys = [
+        [101n, 202n, 303n],
+        [404n, 505n, 606n],
+        [707n, 808n, 909n],
+        [111n, 222n, 333n],
+        [444n, 555n, 666n],
+      ];
+      const evalPoly = (coeffs, x) =>
+        modQ(coeffs[0] + modQ(coeffs[1] * x) + modQ(coeffs[2] * modQ(x * x)));
+
+      const secretShares = new Map();
+      for (let j = 1; j <= 5; j++) {
+        let s = 0n;
+        for (let i = 0; i < 5; i++) {
+          s = modQ(s + evalPoly(nodePolys[i], BigInt(j)));
+        }
+        secretShares.set(j, s);
+      }
+
+      let groupSecret = 0n;
+      for (let i = 0; i < 5; i++) {
+        groupSecret = modQ(groupSecret + nodePolys[i][0]);
+      }
+      const groupPub = pointMul(G, groupSecret);
+      const groupPubKeyX = '0x' + groupPub.x.toString(16).padStart(64, '0');
+      const groupPubKeyParity = (groupPub.y & 1n) === 0n ? 27 : 28;
+
+      await expect(oracle.connect(owner).setTssGroupPublicKey(groupPubKeyX, groupPubKeyParity))
+        .to.emit(oracle, 'TssGroupPublicKeyUpdated')
+        .withArgs(groupPubKeyX, groupPubKeyParity);
+
+      const batch = await makeBatch({
+        batchNonce: 1,
+        entries: [makeEntry({ stellarAddress: stellarAddr(9), score: 850, sourceLedgerSeq: 77 })],
+      });
+      const payload = encodeBatch(batch);
+      const messageHash = ethers.solidityPackedKeccak256(
+        ['bytes32', 'uint64', 'bytes32'],
+        [REGISTRY_ID, batch.batchNonce, ethers.keccak256(payload)],
+      );
+
+      // 3-of-5 signing with nodes [1, 3, 4] (nodes 2 and 5 offline)
+      const signers = [1, 3, 4];
+      const nonces = {
+        1: { d: 12345n, e: 67890n, rho: 11n },
+        3: { d: 23456n, e: 78901n, rho: 13n },
+        4: { d: 34567n, e: 89012n, rho: 17n },
+      };
+
+      let groupR = { x: 0n, y: 0n, inf: true };
+      for (const id of signers) {
+        const kI = modQ(nonces[id].d + modQ(nonces[id].e * nonces[id].rho));
+        groupR = pointAdd(groupR, pointMul(G, kI));
+      }
+      const commitmentAddress = pointToEthAddress(groupR);
+
+      const challengeDigest = ethers.solidityPackedKeccak256(
+        ['address', 'uint8', 'bytes32', 'bytes32'],
+        [commitmentAddress, groupPubKeyParity, groupPubKeyX, messageHash],
+      );
+      const c = modQ(BigInt(challengeDigest));
+
+      let zAgg = 0n;
+      for (const id of signers) {
+        const lam = lagrangeCoeff(id, signers);
+        const kI = modQ(nonces[id].d + modQ(nonces[id].e * nonces[id].rho));
+        const zI = modQ(kI + modQ(modQ(lam * secretShares.get(id)) * c));
+        zAgg = modQ(zAgg + zI);
+      }
+
+      expect(await oracle.verifyThresholdSignature(messageHash, commitmentAddress, zAgg)).to.equal(
+        true,
+      );
+
+      await expect(oracle.connect(other).receiveThresholdBatch(payload, commitmentAddress, zAgg))
+        .to.emit(oracle, 'ThresholdBatchRelayed')
+        .withArgs(REGISTRY_ID, 1n, commitmentAddress, zAgg);
+
+      const stored = await oracle.getTrustScore(stellarAddr(9));
+      expect(stored.score).to.equal(850n);
+      expect(stored.sourceLedgerSeq).to.equal(77n);
+    });
+
+    it('reverts with InvalidThresholdSignature when signature share or payload is tampered', async function () {
+      const { owner, oracle } = await loadFixture(deployFixture);
+      const pub = pointMul(G, 999n);
+      const pubX = '0x' + pub.x.toString(16).padStart(64, '0');
+      const parity = (pub.y & 1n) === 0n ? 27 : 28;
+      await oracle.connect(owner).setTssGroupPublicKey(pubX, parity);
+
+      const batch = await makeBatch({ batchNonce: 1 });
+      const payload = encodeBatch(batch);
+      const fakeR = pointToEthAddress(pointMul(G, 555n));
+
+      await expect(
+        oracle.receiveThresholdBatch(payload, fakeR, 123456n),
+      ).to.be.revertedWithCustomError(oracle, 'InvalidThresholdSignature');
+    });
+  });
 });

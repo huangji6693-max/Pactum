@@ -21,6 +21,14 @@ contract PactumTrustOracle is IPactumTrustOracle, IPactumMessageReceiver, Ownabl
     /// @notice Upper bound on entries per batch, so processing one message has predictable gas.
     uint256 public constant MAX_BATCH_SIZE = 50;
 
+    /// @notice secp256k1 subgroup order Q for FROST / Schnorr threshold signature verification.
+    uint256 public constant SECP256K1_Q =
+        0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+
+    /// @notice Shared FROST / TSS group public key x-coordinate and parity (27 or 28).
+    bytes32 public tssGroupPubKeyX;
+    uint8 public tssGroupPubKeyParity;
+
     /// @notice The messaging network's verified endpoint. Only this address may call
     /// `receiveMessage`.
     address public messagingEndpoint;
@@ -56,12 +64,21 @@ contract PactumTrustOracle is IPactumTrustOracle, IPactumMessageReceiver, Ownabl
     error NonceNotIncreasing(uint64 batchNonce, uint64 lastBatchNonce);
     error BatchTooStale(uint64 batchTimestamp, uint256 nowTimestamp, uint256 maxBatchAge);
     error LedgerSeqNotIncreasing(bytes32 stellarAddress, uint64 sourceLedgerSeq, uint64 lastLedgerSeq);
+    error InvalidTssConfiguration(bytes32 pubKeyX, uint8 parity);
+    error InvalidThresholdSignature(address commitmentAddress, uint256 z);
 
     event MessagingEndpointUpdated(address indexed endpoint);
     event TrustedRemoteUpdated(uint32 indexed sourceChainId, bytes32 sourceAddress);
     event RegistryIdUpdated(bytes32 indexed registryId);
     event MaxBatchAgeUpdated(uint256 maxBatchAge);
     event EmitDetailedEventsUpdated(bool enabled);
+    event TssGroupPublicKeyUpdated(bytes32 indexed pubKeyX, uint8 parity);
+    event ThresholdBatchRelayed(
+        bytes32 indexed registryId,
+        uint64 indexed batchNonce,
+        address indexed commitmentAddress,
+        uint256 z
+    );
 
     struct TrustScoreEntry {
         bytes32 stellarAddress;
@@ -128,6 +145,84 @@ contract PactumTrustOracle is IPactumTrustOracle, IPactumMessageReceiver, Ownabl
     function setEmitDetailedEvents(bool enabled) external onlyOwner {
         emitDetailedEvents = enabled;
         emit EmitDetailedEventsUpdated(enabled);
+    }
+
+    function setTssGroupPublicKey(bytes32 pubKeyX, uint8 parity) external onlyOwner {
+        if (pubKeyX == bytes32(0) || (parity != 27 && parity != 28)) {
+            revert InvalidTssConfiguration(pubKeyX, parity);
+        }
+        tssGroupPubKeyX = pubKeyX;
+        tssGroupPubKeyParity = parity;
+        emit TssGroupPublicKeyUpdated(pubKeyX, parity);
+    }
+
+    // ---------------------------------------------------------------------
+    // FROST / TSS Threshold Signature Verification & Relay (#299)
+    // ---------------------------------------------------------------------
+
+    /// @notice Verifies a FROST / Schnorr threshold signature over secp256k1 using the native
+    /// `ecrecover` precompile (z * G - c * Y == R).
+    function verifyThresholdSignature(
+        bytes32 messageHash,
+        address commitmentAddress,
+        uint256 z
+    ) public view returns (bool) {
+        if (
+            tssGroupPubKeyX == bytes32(0) ||
+            (tssGroupPubKeyParity != 27 && tssGroupPubKeyParity != 28) ||
+            commitmentAddress == address(0) ||
+            z == 0 ||
+            z >= SECP256K1_Q
+        ) {
+            return false;
+        }
+
+        uint256 pubKeyX = uint256(tssGroupPubKeyX);
+        uint256 c = uint256(
+            keccak256(
+                abi.encodePacked(
+                    commitmentAddress,
+                    tssGroupPubKeyParity,
+                    tssGroupPubKeyX,
+                    messageHash
+                )
+            )
+        ) % SECP256K1_Q;
+
+        if (c == 0) {
+            return false;
+        }
+
+        uint256 zMulX = mulmod(z, pubKeyX, SECP256K1_Q);
+        uint256 cMulX = mulmod(c, pubKeyX, SECP256K1_Q);
+        if (zMulX == 0 || cMulX == 0) {
+            return false;
+        }
+
+        bytes32 ecMsgHash = bytes32(SECP256K1_Q - zMulX);
+        bytes32 ecR = tssGroupPubKeyX;
+        bytes32 ecS = bytes32(SECP256K1_Q - cMulX);
+
+        address recovered = ecrecover(ecMsgHash, tssGroupPubKeyParity, ecR, ecS);
+        return recovered != address(0) && recovered == commitmentAddress;
+    }
+
+    /// @notice Accepts a bridged trust score batch directly authorized by a t-of-n FROST
+    /// threshold signature from the decentralized attestor committee.
+    function receiveThresholdBatch(
+        bytes calldata payload,
+        address commitmentAddress,
+        uint256 z
+    ) external {
+        TrustScoreBatch memory batch = abi.decode(payload, (TrustScoreBatch));
+        bytes32 messageHash = keccak256(
+            abi.encodePacked(registryId, batch.batchNonce, keccak256(payload))
+        );
+        if (!verifyThresholdSignature(messageHash, commitmentAddress, z)) {
+            revert InvalidThresholdSignature(commitmentAddress, z);
+        }
+        _applyBatch(batch);
+        emit ThresholdBatchRelayed(batch.registryId, batch.batchNonce, commitmentAddress, z);
     }
 
     // ---------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import { ethers } from 'ethers';
+import { FrostTssCoordinator, ThresholdSignature, keccak256Hex } from '../crypto/tss';
 
 export interface SorobanTrustScoreSnapshot {
   score: number;
@@ -58,6 +59,7 @@ export interface RelayerConfig {
   pollIntervalMs?: number;
   overrideSigningKey?: string;
   batchStore?: IBatchStore;
+  tssCoordinator?: FrostTssCoordinator;
 }
 
 export class CrossChainRelayer {
@@ -68,6 +70,7 @@ export class CrossChainRelayer {
   private currentNonce: bigint = 0n;
   private isRunning: boolean = false;
   private batchStore: IBatchStore;
+  private tssCoordinator?: FrostTssCoordinator;
 
   constructor(
     sorobanClient: ISorobanClient,
@@ -80,6 +83,87 @@ export class CrossChainRelayer {
     this.signer = signer;
     this.registryId = config.registryId;
     this.batchStore = config.batchStore || new MemoryBatchStore();
+    this.tssCoordinator = config.tssCoordinator;
+  }
+
+  public setTssCoordinator(coordinator: FrostTssCoordinator): void {
+    this.tssCoordinator = coordinator;
+  }
+
+  /**
+   * Computes the canonical threshold batch digest matching `PactumTrustOracle.receiveThresholdBatch`:
+   *   keccak256(abi.encodePacked(registryId, batchNonce, keccak256(encodedPayload)))
+   */
+  public computeThresholdBatchDigest(batchNonce: bigint, encodedPayload: string): string {
+    const payloadHash = keccak256Hex(encodedPayload);
+    const packed =
+      this.registryId.replace(/^0x/, '').padStart(64, '0') +
+      batchNonce.toString(16).padStart(16, '0') +
+      payloadHash.replace(/^0x/, '').padStart(64, '0');
+    return keccak256Hex('0x' + packed);
+  }
+
+  /**
+   * Coordinates a 2-round FROST t-of-n threshold signature across the decentralized attestor
+   * committee and relays the signed batch to `PactumTrustOracle.receiveThresholdBatch`.
+   */
+  public async submitBatchWithThresholdSignature(
+    entries: TrustScoreEntry[],
+    options?: {
+      offlineNodeIds?: number[];
+      corruptShareHooks?: Record<number, (share: bigint) => bigint>;
+    },
+  ): Promise<{ txHash: string; signature: ThresholdSignature; encodedPayload: string }> {
+    if (!this.tssCoordinator) {
+      throw new Error('FROST TSS coordinator is not configured on CrossChainRelayer');
+    }
+
+    if (this.currentNonce === 0n) {
+      try {
+        const onChainNonce = await this.oracleContract.lastBatchNonce();
+        this.currentNonce = BigInt(onChainNonce);
+      } catch {
+        // Fallback to local tracking if view fails
+      }
+    }
+
+    this.currentNonce += 1n;
+    const batchNonce = this.currentNonce;
+    const now = BigInt(Math.floor(Date.now() / 1000));
+
+    const batch: TrustScoreBatch = {
+      version: 1,
+      registryId: this.registryId,
+      batchNonce,
+      batchTimestamp: now,
+      entries,
+    };
+
+    const encodedPayload = this.encodeBatch(batch);
+    const messageHash = this.computeThresholdBatchDigest(batchNonce, encodedPayload);
+    const signature = await this.tssCoordinator.sign(messageHash, options);
+
+    await this.batchStore.saveBatch(batch);
+
+    let tx: any;
+    try {
+      tx = await this.oracleContract.receiveThresholdBatch(
+        encodedPayload,
+        signature.commitmentAddress,
+        signature.z,
+      );
+    } catch (broadcastError) {
+      await this.batchStore.deleteBatch(batchNonce);
+      this.currentNonce -= 1n;
+      throw broadcastError;
+    }
+
+    const receipt = await tx.wait();
+    return {
+      txHash: receipt ? receipt.hash : tx.hash,
+      signature,
+      encodedPayload,
+    };
   }
 
   /**
