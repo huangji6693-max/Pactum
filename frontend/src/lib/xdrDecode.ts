@@ -9,7 +9,14 @@
  * @see https://github.com/LynxXProtocol/Pactum/issues/144
  */
 
-import { xdr, scValToNative } from '@stellar/stellar-sdk';
+import {
+  xdr,
+  scValToNative,
+  TransactionBuilder,
+  StrKey,
+  Keypair,
+  Networks,
+} from '@stellar/stellar-sdk';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -554,4 +561,271 @@ export function isSorobanXdrError(error: unknown): boolean {
   const message = typeof error === 'string' ? error : error instanceof Error ? error.message : '';
   // Base64 patterns are long alphanumeric strings with optional padding
   return /[A-Za-z0-9+/]{40,}={0,2}/.test(message);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Signature Partial XDR Envelope Decoding & Inspection (#300)
+// ---------------------------------------------------------------------------
+
+export interface ConfiguredSignerWeight {
+  key: string;
+  weight: number;
+  label?: string;
+}
+
+export interface MultiSigSignerStatus {
+  publicKey?: string;
+  label?: string;
+  hintHex: string;
+  weight: number;
+  signed: boolean;
+  signatureBase64?: string;
+}
+
+export interface DecodedEnvelopeOperation {
+  index: number;
+  type: string;
+  contractId?: string;
+  functionName?: string;
+  args: Record<string, unknown>;
+  summary: string;
+}
+
+export interface DecodedPartialEnvelope {
+  envelopeXdr: string;
+  txHashHex: string;
+  sourceAccount: string;
+  sequenceNumber: string;
+  feeStroops: string;
+  networkPassphrase: string;
+  operations: DecodedEnvelopeOperation[];
+  signers: MultiSigSignerStatus[];
+  collectedSignatures: Array<{
+    hintHex: string;
+    signatureBase64: string;
+    matchedPublicKey?: string;
+    weight: number;
+  }>;
+  collectedWeight: number;
+  requiredThreshold: number;
+  remainingWeight: number;
+  thresholdMet: boolean;
+  thresholdLabel: string;
+}
+
+export interface DecodePartialEnvelopeOptions {
+  networkPassphrase?: string;
+  knownSigners?: ConfiguredSignerWeight[];
+  requiredThreshold?: number;
+}
+
+function pubKeyToHintHex(publicKey: string): string | null {
+  try {
+    const raw = StrKey.decodeEd25519PublicKey(publicKey);
+    return Buffer.from(raw.subarray(raw.length - 4)).toString('hex');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decodes a partial or complete Stellar/Soroban transaction envelope XDR into
+ * a structured multi-signature inspection report, including collected signers,
+ * signer weights, required threshold progress (e.g. "Weight 10/20 reached"),
+ * and human-readable contract operation parameters.
+ */
+export function decodePartialTransactionEnvelope(
+  envelopeXdr: string,
+  options: DecodePartialEnvelopeOptions = {},
+): DecodedPartialEnvelope {
+  const cleanedXdr = envelopeXdr.trim();
+  const networkPassphrase = options.networkPassphrase || Networks.TESTNET;
+  const parsedTx = TransactionBuilder.fromXDR(cleanedXdr, networkPassphrase);
+
+  const txHashBuffer = parsedTx.hash();
+  const txHashHex = Buffer.from(txHashBuffer).toString('hex');
+
+  const sourceAccount =
+    'source' in parsedTx && typeof parsedTx.source === 'string'
+      ? parsedTx.source
+      : 'innerTransaction' in parsedTx
+        ? parsedTx.innerTransaction.source
+        : '';
+
+  const sequenceNumber =
+    'sequence' in parsedTx && typeof parsedTx.sequence === 'string'
+      ? parsedTx.sequence
+      : 'innerTransaction' in parsedTx
+        ? parsedTx.innerTransaction.sequence
+        : '0';
+
+  const feeStroops = String(parsedTx.fee ?? '0');
+
+  const rawOps =
+    'operations' in parsedTx
+      ? parsedTx.operations
+      : 'innerTransaction' in (parsedTx as any)
+        ? (parsedTx as any).innerTransaction.operations
+        : [];
+
+  const operations: DecodedEnvelopeOperation[] = rawOps.map((op: any, idx: number) => {
+    const opType = String(op.type ?? 'invokeHostFunction');
+    if (opType === 'invokeHostFunction' && op.func) {
+      try {
+        const hostFn = op.func as xdr.HostFunction;
+        if (hostFn.switch().name === 'hostFunctionTypeInvokeContract') {
+          const invokeArgs = hostFn.invokeContract();
+          let contractId: string | undefined;
+          try {
+            const scAddr = invokeArgs.contractAddress();
+            if (scAddr.switch().name === 'scAddressTypeContract') {
+              contractId = StrKey.encodeContract(
+                Buffer.from(scAddr.contractId() as unknown as Uint8Array),
+              );
+            }
+          } catch {
+            contractId = undefined;
+          }
+          const fnName = invokeArgs.functionName().toString();
+          const rawScVals = invokeArgs.args() ?? [];
+          const nativeArgs = rawScVals.map((scv) => {
+            const val = safeScValToNative(scv);
+            return typeof val === 'bigint' ? val.toString() : val;
+          });
+          const labeledArgs = labelFunctionArgs(fnName, nativeArgs);
+
+          return {
+            index: idx,
+            type: opType,
+            contractId,
+            functionName: fnName,
+            args: labeledArgs,
+            summary: `Invoke ${fnName}(${Object.entries(labeledArgs)
+              .map(
+                ([k, v]) =>
+                  `${k}=${typeof v === 'string' || typeof v === 'bigint' ? String(v) : JSON.stringify(v)}`,
+              )
+              .join(', ')})`,
+          };
+        }
+      } catch {
+        // fallback below
+      }
+    }
+
+    return {
+      index: idx,
+      type: opType,
+      args: {},
+      summary: `Operation #${idx + 1}: ${opType}`,
+    };
+  });
+
+  const knownSigners = options.knownSigners ?? [];
+  const rawSignatures = parsedTx.signatures ?? [];
+
+  const matchedSignerKeys = new Set<string>();
+  const collectedSignatures: Array<{
+    hintHex: string;
+    signatureBase64: string;
+    matchedPublicKey?: string;
+    weight: number;
+  }> = [];
+
+  for (const sig of rawSignatures) {
+    const hintHex = Buffer.from(sig.hint()).toString('hex');
+    const sigBytes = sig.signature();
+    const signatureBase64 = Buffer.from(sigBytes).toString('base64');
+
+    let matchedSigner: ConfiguredSignerWeight | undefined;
+
+    for (const candidate of knownSigners) {
+      const candidateHint = pubKeyToHintHex(candidate.key);
+      if (candidateHint !== hintHex) continue;
+
+      try {
+        const kp = Keypair.fromPublicKey(candidate.key);
+        if (kp.verify(txHashBuffer, sigBytes)) {
+          matchedSigner = candidate;
+          break;
+        }
+      } catch {
+        matchedSigner = candidate;
+        break;
+      }
+    }
+
+    if (!matchedSigner) {
+      matchedSigner = knownSigners.find((c) => pubKeyToHintHex(c.key) === hintHex);
+    }
+
+    const weight = matchedSigner ? matchedSigner.weight : 10;
+    if (matchedSigner) {
+      matchedSignerKeys.add(matchedSigner.key);
+    }
+
+    collectedSignatures.push({
+      hintHex,
+      signatureBase64,
+      matchedPublicKey: matchedSigner?.key,
+      weight,
+    });
+  }
+
+  const signers: MultiSigSignerStatus[] = [];
+  for (const configured of knownSigners) {
+    const hintHex = pubKeyToHintHex(configured.key) ?? '00000000';
+    const matchingCollected = collectedSignatures.find(
+      (c) => c.matchedPublicKey === configured.key || c.hintHex === hintHex,
+    );
+    signers.push({
+      publicKey: configured.key,
+      label: configured.label,
+      hintHex,
+      weight: configured.weight,
+      signed: Boolean(matchingCollected),
+      signatureBase64: matchingCollected?.signatureBase64,
+    });
+  }
+
+  // Include any signatures from unknown signers not in knownSigners list
+  for (const col of collectedSignatures) {
+    if (!col.matchedPublicKey && !signers.some((s) => s.hintHex === col.hintHex)) {
+      signers.push({
+        hintHex: col.hintHex,
+        weight: col.weight,
+        signed: true,
+        signatureBase64: col.signatureBase64,
+      });
+    }
+  }
+
+  const collectedWeight = collectedSignatures.reduce((acc, s) => acc + s.weight, 0);
+  const requiredThreshold =
+    typeof options.requiredThreshold === 'number' && options.requiredThreshold > 0
+      ? options.requiredThreshold
+      : knownSigners.length > 0
+        ? knownSigners.reduce((acc, s) => acc + s.weight, 0)
+        : 20;
+
+  const remainingWeight = Math.max(0, requiredThreshold - collectedWeight);
+  const thresholdMet = collectedWeight >= requiredThreshold && requiredThreshold > 0;
+  const thresholdLabel = `Weight ${collectedWeight}/${requiredThreshold} reached`;
+
+  return {
+    envelopeXdr: cleanedXdr,
+    txHashHex,
+    sourceAccount,
+    sequenceNumber,
+    feeStroops,
+    networkPassphrase,
+    operations,
+    signers,
+    collectedSignatures,
+    collectedWeight,
+    requiredThreshold,
+    remainingWeight,
+    thresholdMet,
+    thresholdLabel,
+  };
 }
