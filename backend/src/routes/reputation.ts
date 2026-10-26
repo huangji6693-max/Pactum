@@ -4,10 +4,93 @@ import { ReputationCache } from '../cache/reputationCache';
 import { CertificateService } from '../services/CertificateService';
 import { queryTimescale } from '../db/timescale';
 import { SorobanClient } from '../soroban/client';
+import {
+  BulletproofRangeError,
+  BulletproofRangeProof,
+  BulletproofVerificationError,
+  deserializeBulletproof,
+  PEDERSEN_P,
+  verifyBulletproofBatchStrict,
+  verifyBulletproofStrict,
+  verifyRangeProof,
+} from '../crypto/bulletproof';
 
 const STELLAR_ADDRESS = /^G[A-Z2-7]{55}$/;
 const DEFAULT_HISTORY_DAYS = 30;
 const MAX_HISTORY_DAYS = 365;
+
+/**
+ * Middleware that verifies Bulletproof range proofs (single or batch) on
+ * encrypted private feedback submission routes before persisting outcomes.
+ */
+export const verifyFeedbackRangeProofMiddleware = (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void => {
+  try {
+    const body = req.body ?? {};
+    const pkN = body.pkN ? BigInt('0x' + String(body.pkN).replace(/^0x/, '')) : PEDERSEN_P;
+
+    if (Array.isArray(body.bulletproofs) && body.bulletproofs.length > 0) {
+      const decoded: BulletproofRangeProof[] = body.bulletproofs.map((item: unknown) => {
+        if (typeof item === 'string') {
+          return deserializeBulletproof(Buffer.from(item.replace(/^0x/, ''), 'hex'));
+        }
+        return item as BulletproofRangeProof;
+      });
+      verifyBulletproofBatchStrict(decoded, pkN);
+      next();
+      return;
+    }
+
+    if (body.bulletproof !== undefined) {
+      const proof: BulletproofRangeProof =
+        typeof body.bulletproof === 'string'
+          ? deserializeBulletproof(Buffer.from(body.bulletproof.replace(/^0x/, ''), 'hex'))
+          : (body.bulletproof as BulletproofRangeProof);
+      verifyBulletproofStrict(proof, pkN);
+      next();
+      return;
+    }
+
+    if (body.proof !== undefined) {
+      const p = body.proof;
+      const rangeProof = {
+        commitment: BigInt('0x' + String(p.commitment).replace(/^0x/, '')),
+        witnessA: BigInt('0x' + String(p.witnessA).replace(/^0x/, '')),
+        witnessB: BigInt('0x' + String(p.witnessB).replace(/^0x/, '')),
+      };
+      if (!verifyRangeProof(rangeProof, pkN)) {
+        throw new BulletproofVerificationError(
+          'TAMPERED_WITNESS',
+          'Schnorr range proof verification failed',
+        );
+      }
+      next();
+      return;
+    }
+
+    res.status(400).json({
+      error: 'Bad Request',
+      code: 'MISSING_RANGE_PROOF',
+      message: 'A valid range proof (bulletproof, bulletproofs, or proof) is required',
+    });
+  } catch (error) {
+    if (error instanceof BulletproofRangeError || error instanceof BulletproofVerificationError) {
+      res.status(400).json({
+        error: 'Range Proof Verification Failed',
+        code: error.code,
+        message: error.message,
+      });
+      return;
+    }
+    res.status(400).json({
+      error: 'Invalid Range Proof Payload',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+};
 
 // Zod schema for validating the export certificate request
 const exportCertificateSchema = z.object({
@@ -42,6 +125,20 @@ export function createReputationRouter(
   sorobanClient?: SorobanClient,
 ): Router {
   const router = Router();
+
+  // POST /feedback - Verifies single or batch Bulletproof range proofs for encrypted feedback
+  router.post(
+    '/feedback',
+    verifyFeedbackRangeProofMiddleware,
+    async (req: Request, res: Response) => {
+      const count = Array.isArray(req.body?.bulletproofs) ? req.body.bulletproofs.length : 1;
+      res.status(200).json({
+        verified: true,
+        verifiedCount: count,
+        message: 'Encrypted feedback range proof verified',
+      });
+    },
+  );
 
   // POST /export/certificate - Exports a Reputation Certificate (VC)
   router.post(

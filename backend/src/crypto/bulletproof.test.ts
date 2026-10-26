@@ -12,6 +12,16 @@ import {
   fiatShamirChallenge,
   generateRangeProof,
   verifyRangeProof,
+  verifyRangeProofBatch,
+  generateBulletproof,
+  verifyBulletproof,
+  verifyBulletproofStrict,
+  verifyBulletproofBatch,
+  verifyBulletproofBatchStrict,
+  serializeBulletproof,
+  deserializeBulletproof,
+  BulletproofRangeError,
+  BulletproofVerificationError,
   PEDERSEN_P,
   PEDERSEN_G,
   PEDERSEN_H,
@@ -19,7 +29,7 @@ import {
   RATING_MAX,
   RangeProof,
 } from './bulletproof';
-import { modPow } from './paillier';
+import { modPow, multiExp, encAddBatch, keyPairFromPrimes, encrypt, decrypt } from './paillier';
 
 // Use the compact modulus as the pkN in all tests.
 const PK_N = PEDERSEN_P;
@@ -147,3 +157,147 @@ test('distinct blinding factors produce distinct commitments', () => {
   assert.ok(verifyRangeProof(p1, PK_N));
   assert.ok(verifyRangeProof(p2, PK_N));
 });
+
+// ---------------------------------------------------------------------------
+// Issue #306 — Logarithmic IPA Bulletproofs (32-bit and 64-bit) & Batch Verification
+// ---------------------------------------------------------------------------
+
+test('32-bit IPA Bulletproof generates and verifies boundary and interior values', () => {
+  const values = [0n, 1n, 42n, 65535n, (1n << 32n) - 1n];
+  for (const v of values) {
+    const proof = generateBulletproof(v, 98765n + v, PK_N, 32);
+    assert.equal(proof.ipa.L.length, 5, '32-bit proof must have log2(32) = 5 IPA rounds');
+    assert.ok(verifyBulletproof(proof, PK_N), `32-bit proof for ${v} should verify`);
+  }
+});
+
+test('64-bit IPA Bulletproof generates and verifies with compact size < 1 KB', () => {
+  const values = [0n, 1n, 5n, 1_000_000_000n, (1n << 63n) - 1n, (1n << 64n) - 1n];
+  for (const v of values) {
+    const proof = generateBulletproof(v, 54321n + (v & 0xffffn), PK_N, 64);
+    assert.equal(proof.ipa.L.length, 6, '64-bit proof must have log2(64) = 6 IPA rounds');
+    assert.ok(verifyBulletproof(proof, PK_N), `64-bit proof for ${v} should verify`);
+
+    const serialized = serializeBulletproof(proof);
+    assert.ok(
+      serialized.byteLength < 1024,
+      `serialized 64-bit proof size (${serialized.byteLength} B) must be < 1 KB`,
+    );
+    assert.equal(serialized.byteLength, 177);
+
+    const roundTrip = deserializeBulletproof(serialized);
+    assert.ok(verifyBulletproof(roundTrip, PK_N), 'deserialized proof must verify');
+  }
+});
+
+test('Batch verification of 100 64-bit Bulletproofs runs in < 50ms', () => {
+  const proofs = [];
+  for (let i = 0; i < 100; i++) {
+    const val = BigInt(i * 1_000_003 + 7);
+    proofs.push(generateBulletproof(val, BigInt(10_000 + i), PK_N, 64));
+  }
+
+  // Warm up JIT once before timing
+  verifyBulletproofBatch(proofs.slice(0, 4), PK_N);
+
+  const start = performance.now();
+  const ok = verifyBulletproofBatch(proofs, PK_N);
+  const elapsedMs = performance.now() - start;
+
+  assert.equal(ok, true, 'batch of 100 valid 64-bit proofs must verify');
+  assert.ok(
+    elapsedMs < 50,
+    `batch verification of 100 proofs took ${elapsedMs.toFixed(2)}ms (expected < 50ms)`,
+  );
+});
+
+test('Out-of-range values fail with explicit BulletproofRangeError codes', () => {
+  assert.throws(
+    () => generateBulletproof(-1n, 123n, PK_N, 64),
+    (err: unknown) =>
+      err instanceof BulletproofRangeError && err.code === 'NEGATIVE_VALUE',
+  );
+
+  assert.throws(
+    () => generateBulletproof(1n << 32n, 123n, PK_N, 32),
+    (err: unknown) =>
+      err instanceof BulletproofRangeError && err.code === 'OUT_OF_RANGE',
+  );
+
+  assert.throws(
+    () => generateBulletproof(1n << 64n, 123n, PK_N, 64),
+    (err: unknown) =>
+      err instanceof BulletproofRangeError && err.code === 'OUT_OF_RANGE',
+  );
+});
+
+test('Tampered commitments and IPA witnesses fail with explicit BulletproofVerificationError codes', () => {
+  const valid = generateBulletproof(123456789n, 777n, PK_N, 64);
+
+  // 1. Out-of-subgroup commitment
+  assert.throws(
+    () => verifyBulletproofStrict({ ...valid, commitment: 0n }, PK_N),
+    (err: unknown) =>
+      err instanceof BulletproofVerificationError && err.code === 'TAMPERED_COMMITMENT',
+  );
+
+  // 2. Tampered polynomial evaluation tHat
+  assert.throws(
+    () => verifyBulletproofStrict({ ...valid, tHat: valid.tHat + 1n }, PK_N),
+    (err: unknown) =>
+      err instanceof BulletproofVerificationError && err.code === 'POLYNOMIAL_IDENTITY_FAILED',
+  );
+
+  // 3. Tampered IPA final scalar a
+  assert.throws(
+    () =>
+      verifyBulletproofStrict(
+        { ...valid, ipa: { ...valid.ipa, a: valid.ipa.a + 1n } },
+        PK_N,
+      ),
+    (err: unknown) =>
+      err instanceof BulletproofVerificationError && err.code === 'IPA_VERIFICATION_FAILED',
+  );
+
+  // 4. Batch containing one tampered proof fails with BATCH_VERIFICATION_FAILED
+  const p2 = generateBulletproof(42n, 888n, PK_N, 64);
+  const tamperedBatch = [
+    valid,
+    { ...p2, ipa: { ...p2.ipa, b: p2.ipa.b + 1n } },
+  ];
+  assert.throws(
+    () => verifyBulletproofBatchStrict(tamperedBatch, PK_N),
+    (err: unknown) =>
+      err instanceof BulletproofVerificationError && err.code === 'BATCH_VERIFICATION_FAILED',
+  );
+});
+
+test('multiExp and encAddBatch compute weighted multi-exponentiation accurately', () => {
+  const bases = [3n, 5n, 7n, 11n, 13n];
+  const exps = [19n, 23n, 29n, 31n, 37n];
+  const mod = 1_000_000_007n;
+
+  let naive = 1n;
+  for (let i = 0; i < bases.length; i++) {
+    naive = (naive * modPow(bases[i], exps[i], mod)) % mod;
+  }
+  assert.equal(multiExp(bases, exps, mod), naive);
+
+  const kp = keyPairFromPrimes(61n, 53n);
+  const cts = [
+    encrypt(kp.publicKey, 2n, 3n),
+    encrypt(kp.publicKey, 4n, 5n),
+    encrypt(kp.publicKey, 6n, 7n),
+  ];
+  const combined = encAddBatch(kp.publicKey, cts, [10n, 20n, 30n]);
+  // 2*10 + 4*20 + 6*30 = 20 + 80 + 180 = 280
+  assert.equal(decrypt(kp, combined), 280n);
+
+  const schnorrBatch = [
+    generateRangeProof(1n, 11n, PK_N),
+    generateRangeProof(3n, 22n, PK_N),
+    generateRangeProof(5n, 33n, PK_N),
+  ];
+  assert.equal(verifyRangeProofBatch(schnorrBatch, PK_N), true);
+});
+

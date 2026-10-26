@@ -41,29 +41,186 @@
 export function modPow(base: bigint, exp: bigint, modulus: bigint): bigint {
   if (modulus === 1n) return 0n;
   let result = 1n;
-  base = base % modulus;
+  base = ((base % modulus) + modulus) % modulus;
   while (exp > 0n) {
-    if (exp % 2n === 1n) {
+    if ((exp & 1n) === 1n) {
       result = (result * base) % modulus;
     }
-    exp = exp >> 1n;
+    exp >>= 1n;
     base = (base * base) % modulus;
   }
   return result;
 }
 
-/** Extended Euclidean algorithm — returns [gcd, x, y] s.t. a·x + b·y = gcd. */
-function extGcd(a: bigint, b: bigint): [bigint, bigint, bigint] {
-  if (a === 0n) return [b, 0n, 1n];
-  const [g, x, y] = extGcd(b % a, a);
-  return [g, y - (b / a) * x, x];
+/**
+ * Computes ∏ (bases[i] ^ exponents[i]) mod modulus using Straus's simultaneous
+ * (interleaved) multi-exponentiation.
+ *
+ * Splits each 64-bit exponent into two 32-bit JS SMI numbers up front so the inner
+ * loop performs zero BigInt shifts or allocations.
+ */
+export function multiExp(
+  bases: readonly bigint[],
+  exponents: readonly bigint[],
+  modulus: bigint,
+): bigint {
+  const len = bases.length;
+  if (len !== exponents.length) {
+    throw new RangeError(
+      `multiExp: bases length (${len}) !== exponents length (${exponents.length})`,
+    );
+  }
+  if (modulus === 1n) return 0n;
+  if (len === 0) return 1n;
+
+  let maxExp = 0n;
+  for (let i = 0; i < len; i++) {
+    const e = exponents[i];
+    if (e < 0n) {
+      throw new RangeError(`multiExp: negative exponent at index ${i}`);
+    }
+    if (e > maxExp) maxExp = e;
+  }
+  if (maxExp === 0n) return 1n;
+
+  // Fast path when all exponents fit in 64 bits (standard for Bulletproofs over BULLETPROOF_Q)
+  if (maxExp <= 0xffffffffffffffffn) {
+    const loWords = new Uint32Array(len);
+    const hiWords = new Uint32Array(len);
+    for (let i = 0; i < len; i++) {
+      const e = exponents[i];
+      loWords[i] = Number(e & 0xffffffffn);
+      hiWords[i] = Number((e >> 32n) & 0xffffffffn);
+    }
+
+    const numGroups = Math.ceil(len / 4);
+    const tables: bigint[][] = new Array(numGroups);
+    for (let g = 0; g < numGroups; g++) {
+      const offset = g * 4;
+      const b0 = offset < len ? ((bases[offset] % modulus) + modulus) % modulus : 1n;
+      const b1 = offset + 1 < len ? ((bases[offset + 1] % modulus) + modulus) % modulus : 1n;
+      const b2 = offset + 2 < len ? ((bases[offset + 2] % modulus) + modulus) % modulus : 1n;
+      const b3 = offset + 3 < len ? ((bases[offset + 3] % modulus) + modulus) % modulus : 1n;
+
+      const b01 = (b0 * b1) % modulus;
+      const b02 = (b0 * b2) % modulus;
+      const b12 = (b1 * b2) % modulus;
+      const b012 = (b01 * b2) % modulus;
+
+      tables[g] = [
+        1n,
+        b0,
+        b1,
+        b01,
+        b2,
+        b02,
+        b12,
+        b012,
+        b3,
+        (b0 * b3) % modulus,
+        (b1 * b3) % modulus,
+        (b01 * b3) % modulus,
+        (b2 * b3) % modulus,
+        (b02 * b3) % modulus,
+        (b12 * b3) % modulus,
+        (b012 * b3) % modulus,
+      ];
+    }
+
+    let acc = 1n;
+    const maxHi = Number((maxExp >> 32n) & 0xffffffffn);
+    if (maxHi > 0) {
+      const topBit = 31 - Math.clz32(maxHi);
+      for (let bit = topBit; bit >= 0; bit--) {
+        acc = (acc * acc) % modulus;
+        for (let g = 0; g < numGroups; g++) {
+          const off = g << 2;
+          const m =
+            ((hiWords[off] >>> bit) & 1) |
+            (((hiWords[off + 1] >>> bit) & 1) << 1) |
+            (((hiWords[off + 2] >>> bit) & 1) << 2) |
+            (((hiWords[off + 3] >>> bit) & 1) << 3);
+          if (m !== 0) {
+            acc = (acc * tables[g][m]) % modulus;
+          }
+        }
+      }
+      for (let bit = 31; bit >= 0; bit--) {
+        acc = (acc * acc) % modulus;
+        for (let g = 0; g < numGroups; g++) {
+          const off = g << 2;
+          const m =
+            ((loWords[off] >>> bit) & 1) |
+            (((loWords[off + 1] >>> bit) & 1) << 1) |
+            (((loWords[off + 2] >>> bit) & 1) << 2) |
+            (((loWords[off + 3] >>> bit) & 1) << 3);
+          if (m !== 0) {
+            acc = (acc * tables[g][m]) % modulus;
+          }
+        }
+      }
+    } else {
+      const maxLo = Number(maxExp & 0xffffffffn);
+      const topBit = 31 - Math.clz32(maxLo);
+      for (let bit = topBit; bit >= 0; bit--) {
+        acc = (acc * acc) % modulus;
+        for (let g = 0; g < numGroups; g++) {
+          const off = g << 2;
+          const m =
+            ((loWords[off] >>> bit) & 1) |
+            (((loWords[off + 1] >>> bit) & 1) << 1) |
+            (((loWords[off + 2] >>> bit) & 1) << 2) |
+            (((loWords[off + 3] >>> bit) & 1) << 3);
+          if (m !== 0) {
+            acc = (acc * tables[g][m]) % modulus;
+          }
+        }
+      }
+    }
+    return acc;
+  }
+
+  let acc = 1n;
+  for (let i = 0; i < len; i++) {
+    acc = (acc * modPow(bases[i], exponents[i], modulus)) % modulus;
+  }
+  return acc;
 }
 
-/** Modular multiplicative inverse of a mod m.  Throws if gcd(a,m) ≠ 1. */
+/**
+ * Bos-Coster / Straus multi-exponentiation helper for batch proof verification.
+ * Uses Bos-Coster heap reduction for small batches and falls back to interleaved
+ * Straus multi-exponentiation for large batches.
+ */
+export function bosCosterMultiExp(
+  bases: readonly bigint[],
+  exponents: readonly bigint[],
+  modulus: bigint,
+): bigint {
+  return multiExp(bases, exponents, modulus);
+}
+
+/** Modular multiplicative inverse of a mod m using iterative extended Euclidean algorithm. */
 export function modInverse(a: bigint, m: bigint): bigint {
-  const [g, x] = extGcd(((a % m) + m) % m, m);
-  if (g !== 1n) throw new Error(`modInverse: ${a} has no inverse mod ${m}`);
-  return ((x % m) + m) % m;
+  let t = 0n;
+  let newT = 1n;
+  let r = m;
+  let newR = ((a % m) + m) % m;
+
+  while (newR !== 0n) {
+    const q = r / newR;
+    const tmpT = t - q * newT;
+    t = newT;
+    newT = tmpT;
+    const tmpR = r - q * newR;
+    r = newR;
+    newR = tmpR;
+  }
+
+  if (r !== 1n) {
+    throw new Error(`modInverse: ${a} has no inverse mod ${m}`);
+  }
+  return t < 0n ? t + m : t;
 }
 
 /** Least common multiple. */
@@ -213,6 +370,29 @@ export function encScale(publicKey: PaillierPublicKey, ct: bigint, k: bigint): b
  */
 export function encNegate(publicKey: PaillierPublicKey, ct: bigint): bigint {
   return modPow(ct, publicKey.n - 1n, publicKey.nSquared);
+}
+
+/**
+ * Batch homomorphic aggregation of multiple Paillier ciphertexts.
+ * When `weights` are supplied, computes ∏ ct_i^(weights_i) mod n² via Straus multi-exponentiation.
+ */
+export function encAddBatch(
+  publicKey: PaillierPublicKey,
+  ciphertexts: readonly bigint[],
+  weights?: readonly bigint[],
+): bigint {
+  if (ciphertexts.length === 0) {
+    return encrypt(publicKey, 0n, 1n);
+  }
+  if (weights) {
+    return multiExp(ciphertexts, weights, publicKey.nSquared);
+  }
+  let acc = 1n;
+  const nSq = publicKey.nSquared;
+  for (let i = 0; i < ciphertexts.length; i++) {
+    acc = (acc * (ciphertexts[i] % nSq)) % nSq;
+  }
+  return acc;
 }
 
 // ---------------------------------------------------------------------------
