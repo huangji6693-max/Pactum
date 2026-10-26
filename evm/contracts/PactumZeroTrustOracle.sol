@@ -191,4 +191,22 @@ contract PactumZeroTrustOracle is IPactumZeroTrustOracle, Ownable {
         if (updatedAt == 0) return true;
         return block.timestamp - uint256(updatedAt) > maxAge;
     }
+
+    /// @notice Verifies a canonical Stellar Merkle state proof against `trustedLedgerHeaders`
+    /// without mutating storage, returning the cryptographically verified score and header hash.
+    /// Used by `PactumTrustOracle` during cross-chain fraud proof disproval challenges.
+    function verifyCanonicalProof(
+        PactumStateProofVerifier.StateProof calldata proof
+    ) external view returns (uint32 verifiedScore, bytes32 trustedHeader) {
+        if (registryContractId != bytes32(0) && proof.contractId != registryContractId) {
+            revert MismatchedRegistry(registryContractId, proof.contractId);
+        }
+
+        trustedHeader = trustedLedgerHeaders[proof.ledgerSeq];
+        if (trustedHeader == bytes32(0) || trustedHeader != proof.ledgerHeaderHash) {
+            revert UntrustedHeader(proof.ledgerSeq, proof.ledgerHeaderHash);
+        }
+
+        verifiedScore = PactumStateProofVerifier.verifyProofOrRevert(proof, trustedHeader);
+    }
 }
